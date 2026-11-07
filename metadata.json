@@ -1,0 +1,8 @@
+{
+  "name": "Binance TurboScalp - Real-Time AI Auto-Trading & Signal Scanner",
+  "description": "High-frequency Binance cryptocurrency automated scanner, real-time push trades, instant WebSocket price feeds, multi-indicator confluence alerts, and pro risk management terminal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
