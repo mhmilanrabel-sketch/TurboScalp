@@ -23,6 +23,11 @@ import {
 
 import dotenv from 'dotenv';
 import { registerQuantRoutes } from './server/quantRoutes.js';
+import {
+  registerAutonomousDemoBotRoutes,
+  pauseAllAutonomousDemoBots,
+  shutdownAutonomousDemoBot
+} from './server/autonomousDemoBot.js';
 
 dotenv.config();
 
@@ -714,6 +719,31 @@ async function calculateDemoOrder(input: any) {
 
 }
 
+// Authenticated Binance USD-M Futures Demo autonomous bot routes.
+registerAutonomousDemoBotRoutes(app, {
+  getCredentials: req => {
+    const credentials = getSessionCredentials(req);
+    if (!credentials) {
+      throw new BinanceRequestError('Binance account is not connected.', 401);
+    }
+    return credentials;
+  },
+  binanceRequest,
+  calculateDemoOrder,
+  getSignals: async () => {
+    const response = await axios.get(
+      `http://127.0.0.1:${PORT}/api/quant/scan?limit=40&minVolume=250000`,
+      { timeout: 45_000 }
+    );
+    if (!response.data?.success || !Array.isArray(response.data?.signals)) {
+      throw new Error(response.data?.message || response.data?.error || 'Scanner returned an invalid response.');
+    }
+    return response.data.signals;
+  },
+  maxOrderUsd: MAX_ORDER_USD,
+  maxLeverage: MAX_LEVERAGE,
+});
+
 // ======================================================
 // CONNECT WITH MANUAL CREDENTIALS
 // ======================================================
@@ -808,6 +838,7 @@ app.post('/api/binance/connect', async (req, res) => {
 
 app.post('/api/binance/disconnect', (req, res) => {
 
+  pauseAllAutonomousDemoBots('Binance API disconnected');
   destroySession(req, res);
 
   res.json({
@@ -988,20 +1019,35 @@ app.get('/api/binance/open-orders', async (req, res) => {
 
     }
 
-    const orders = await binanceRequest<any[]>(
-      'GET',
-      '/fapi/v1/openOrders',
-      params,
-      true,
-      credentials
-    );
+    const [orders, algoOrders] = await Promise.all([
+      binanceRequest<any[]>(
+        'GET',
+        '/fapi/v1/openOrders',
+        params,
+        true,
+        credentials
+      ),
+      binanceRequest<any[]>(
+        'GET',
+        '/fapi/v1/openAlgoOrders',
+        params,
+        true,
+        credentials
+      )
+    ]);
+
+    const normalizedAlgoOrders = (algoOrders || []).map(order => ({
+      ...order,
+      orderId: order.algoId,
+      clientOrderId: order.clientAlgoId,
+      status: order.algoStatus,
+      type: order.orderType,
+      conditional: true
+    }));
 
     res.json({
-
       success: true,
-
-      orders: orders || []
-
+      orders: [...(orders || []), ...normalizedAlgoOrders]
     });
 
   } catch (error) {
@@ -1634,6 +1680,7 @@ async function startServer() {
 
 function shutdown() {
 
+  shutdownAutonomousDemoBot();
   shuttingDown = true;
 
   if (reconnectTimer) {

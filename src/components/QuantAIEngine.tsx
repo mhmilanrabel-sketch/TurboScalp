@@ -1,725 +1,496 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Activity,
+  AlertTriangle,
+  ArrowDownRight,
+  ArrowUpRight,
+  Bot,
+  CheckCircle2,
+  Clock3,
+  Download,
+  Pause,
+  Play,
+  RefreshCw,
+  ShieldCheck,
+  Wallet,
+} from 'lucide-react';
 
-type Direction = 'BUY' | 'SELL' | 'NEUTRAL';
-type Signal = {
-  symbol: string;
-  direction: Direction;
-  score: number;
-  confidence: number;
-  price: number;
-  change24h: number;
-  quoteVolume: number;
-  rsi: number;
-  volumeRatio: number;
-  volatilityPct: number;
-  stopLoss: number | null;
-  takeProfit: number | null;
-  reasons: string[];
+type AccountSummary = {
+  availableBalance: string;
+  totalWalletBalance: string;
+  totalUnrealizedProfit: string;
+  canTrade: boolean;
 };
 
-type TradeStatus = 'OPEN' | 'TP' | 'SL';
-type PaperTrade = {
+type TradeRecord = {
   id: string;
   symbol: string;
   side: 'BUY' | 'SELL';
-  entry: number;
-  stop: number;
-  target: number;
-  notional: number;
-  status: TradeStatus;
-  pnl?: number;
-  exitPrice?: number;
+  status: 'OPEN' | 'CLOSED';
+  notionalUsd: number;
+  quantity: string;
+  leverage: number;
+  entryPrice: number;
+  markPrice: number;
+  stopPrice: number;
+  targetPrice: number;
+  unrealizedPnl: number;
+  realizedPnl: number | null;
+  entryOrderId: number | string | null;
+  stopAlgoId: number | string | null;
+  targetAlgoId: number | string | null;
   openedAt: number;
-  closedAt?: number;
+  closedAt: number | null;
+  closeReason: string | null;
 };
 
-type Candle = {
-  time: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
+type BotEvent = { at: number; level: 'INFO' | 'WARN' | 'ERROR' | 'TRADE'; message: string };
+type BotSnapshot = {
+  success: boolean;
+  environment: string;
+  liveTradingEnabled: false;
+  status: 'STOPPED' | 'RUNNING' | 'PAUSED' | 'ERROR';
+  message: string;
+  config: { riskPercent: number; maxNotionalUsd: number; leverage: number; minScore: number; minConfidence: number };
+  activeTrade: TradeRecord | null;
+  trades: TradeRecord[];
+  logs: BotEvent[];
+  stats: { closedTrades: number; wins: number; losses: number; winRate: number | null; netRealizedPnl: number };
+  lastScanAt: number | null;
+  lastScanCount: number;
+  lastCandidate: { symbol: string; direction: string; score: number } | null;
+  updatedAt: number;
 };
 
-const STORAGE_KEY = 'turboscalp.quant-paper-trades.v2';
-const MIN_NOTIONAL = 5;
-const MAX_NOTIONAL = 100;
-const MIN_SCORE = 65;
-const MIN_CONFIDENCE = 80;
-const MIN_VOLUME = 250_000;
-const MIN_VOLATILITY = 0.05;
-const MAX_VOLATILITY = 2.5;
-const MIN_REWARD_RISK = 1.5;
-const MIN_STOP_DISTANCE = 0.001;
-const MAX_STOP_DISTANCE = 0.025;
-const COOLDOWN_MS = 30 * 60 * 1000;
-const REENTRY_PAUSE_MS = 60 * 1000;
-const ESTIMATED_ROUND_TRIP_FEE = 0.0008;
-
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
-
-const formatPrice = (value: number): string => {
-  if (!Number.isFinite(value) || value <= 0) return '—';
-  if (value < 1) return `$${value.toPrecision(5)}`;
-  return `$${value.toLocaleString('en-US', { maximumFractionDigits: 4 })}`;
+type Props = {
+  account: AccountSummary;
+  apiConnected: boolean;
+  accountLoading: boolean;
+  accountError: string;
+  positions: any[];
+  openOrders: any[];
+  onRefreshAccount: () => Promise<void>;
+  onOpenApiSettings: () => void;
 };
 
-const compact = (value: number): string => {
-  if (!Number.isFinite(value)) return '—';
-  if (value >= 1e9) return `${(value / 1e9).toFixed(1)}B`;
-  if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`;
-  if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
-  return value.toFixed(0);
+const blankSnapshot: BotSnapshot = {
+  success: true,
+  environment: 'USD_M_FUTURES_DEMO',
+  liveTradingEnabled: false,
+  status: 'STOPPED',
+  message: 'Connect Binance Futures Demo to enable the autonomous bot.',
+  config: { riskPercent: 0.5, maxNotionalUsd: 100, leverage: 1, minScore: 65, minConfidence: 78 },
+  activeTrade: null,
+  trades: [],
+  logs: [],
+  stats: { closedTrades: 0, wins: 0, losses: 0, winRate: null, netRealizedPnl: 0 },
+  lastScanAt: null,
+  lastScanCount: 0,
+  lastCandidate: null,
+  updatedAt: Date.now(),
 };
 
-const signedPercent = (value: number) => `${value > 0 ? '+' : ''}${Number(value || 0).toFixed(2)}%`;
-
-const formatTime = (timestamp?: number) => timestamp
-  ? new Date(timestamp).toLocaleString([], { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-  : '—';
-
-const formatAge = (timestamp: number, now: number) => {
-  if (!timestamp) return 'Waiting for first scan';
-  const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
-  if (seconds < 5) return 'Updated just now';
-  if (seconds < 60) return `Updated ${seconds}s ago`;
-  return `Updated ${Math.floor(seconds / 60)}m ago`;
-};
-
-const calculateNetPnl = (trade: PaperTrade, price: number) => {
-  if (!Number.isFinite(price) || price <= 0 || trade.entry <= 0) return 0;
-  const move = trade.side === 'BUY'
-    ? (price - trade.entry) / trade.entry
-    : (trade.entry - price) / trade.entry;
-  return trade.notional * move - trade.notional * ESTIMATED_ROUND_TRIP_FEE;
-};
-
-function loadPaperTrades(): PaperTrade[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((trade: any) =>
-      trade &&
-      typeof trade.id === 'string' &&
-      typeof trade.symbol === 'string' &&
-      (trade.side === 'BUY' || trade.side === 'SELL') &&
-      ['OPEN', 'TP', 'SL'].includes(trade.status) &&
-      Number.isFinite(Number(trade.entry)) &&
-      Number.isFinite(Number(trade.stop)) &&
-      Number.isFinite(Number(trade.target)) &&
-      Number.isFinite(Number(trade.notional))
-    ).slice(0, 100);
-  } catch {
-    return [];
-  }
+function money(value: unknown, digits = 2): string {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return '—';
+  return amount.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 
-async function readJson(response: Response): Promise<any> {
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.success === false) {
-    throw new Error(data.message || data.error || `Request failed (${response.status})`);
-  }
-  return data;
+function price(value: unknown): string {
+  const amount = Number(value);
+  if (!(amount > 0) || !Number.isFinite(amount)) return '—';
+  return amount < 1 ? `$${amount.toPrecision(6)}` : `$${amount.toLocaleString('en-US', { maximumFractionDigits: 5 })}`;
 }
 
-function SignalBadge({ direction }: { direction: Direction }) {
-  const tone = direction === 'BUY'
-    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-    : direction === 'SELL'
-      ? 'border-rose-500/30 bg-rose-500/10 text-rose-300'
-      : 'border-slate-700 bg-slate-800 text-slate-400';
-  return <span className={`inline-flex min-w-[58px] justify-center rounded-md border px-2 py-1 text-[8px] font-black tracking-wide ${tone}`}>{direction}</span>;
+function time(value: number | null | undefined): string {
+  return value ? new Date(value).toLocaleString() : '—';
 }
 
-function Metric({
-  label,
-  value,
-  detail,
-  tone = 'text-white',
-}: {
-  label: string;
-  value: string;
-  detail: string;
-  tone?: string;
-}) {
+async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(url, {
+    ...options,
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(options.headers || {}) },
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.success === false) throw new Error(payload.message || payload.error || `Request failed (${response.status})`);
+  return payload as T;
+}
+
+function StatCard({ label, value, hint, tone = 'text-white' }: { label: string; value: string; hint: string; tone?: string }) {
   return (
-    <div className="min-w-0 rounded-xl border border-slate-800 bg-[#0b1421] p-3.5 sm:p-4">
+    <div className="rounded-xl border border-slate-800 bg-[#0a1220] p-4">
       <p className="text-[8px] font-bold uppercase tracking-[0.16em] text-slate-500">{label}</p>
-      <p className={`mt-2 truncate text-xl font-black tracking-tight sm:text-2xl ${tone}`}>{value}</p>
-      <p className="mt-1 truncate text-[9px] text-slate-600">{detail}</p>
+      <p className={`mt-2 text-xl font-black tracking-tight ${tone}`}>{value}</p>
+      <p className="mt-1 text-[8px] text-slate-600">{hint}</p>
     </div>
   );
 }
 
-function CandlestickChart({
-  candles,
-  trade,
-  currentPrice,
-}: {
-  candles: Candle[];
-  trade: PaperTrade | null;
-  currentPrice: number | null;
-}) {
-  const width = 1000;
-  const height = 340;
-  const left = 58;
-  const right = 870;
-  const top = 20;
-  const bottom = 282;
-  const plotWidth = right - left;
-  const plotHeight = bottom - top;
+export function QuantAIEngine({ account, apiConnected, accountLoading, accountError, positions, openOrders, onRefreshAccount, onOpenApiSettings }: Props) {
+  const [snapshot, setSnapshot] = useState<BotSnapshot>(blankSnapshot);
+  const [loading, setLoading] = useState(false);
+  const [actionError, setActionError] = useState('');
+  const [riskPercent, setRiskPercent] = useState('0.5');
+  const [maxNotionalUsd, setMaxNotionalUsd] = useState('100');
+  const [lastSyncAt, setLastSyncAt] = useState(0);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
 
-  if (!candles.length) {
-    return (
-      <div className="flex h-[300px] items-center justify-center rounded-xl border border-dashed border-slate-800 bg-[#080f1b] text-center">
-        <div><p className="text-[11px] font-bold text-slate-300">Waiting for Demo candle data</p><p className="mt-2 text-[9px] text-slate-600">The 15-minute chart will appear after the first successful candle request.</p></div>
-      </div>
-    );
-  }
-
-  const prices = candles.flatMap(candle => [candle.low, candle.high]);
-  if (trade) prices.push(trade.stop, trade.entry, trade.target);
-  if (currentPrice && currentPrice > 0) prices.push(currentPrice);
-  let minPrice = Math.min(...prices);
-  let maxPrice = Math.max(...prices);
-  const spread = Math.max(maxPrice - minPrice, maxPrice * 0.001, Number.EPSILON);
-  minPrice -= spread * 0.08;
-  maxPrice += spread * 0.08;
-  const y = (price: number) => bottom - ((price - minPrice) / (maxPrice - minPrice)) * plotHeight;
-  const step = plotWidth / Math.max(candles.length, 1);
-  const bodyWidth = clamp(step * 0.56, 3, 10);
-
-  const levels = trade ? [
-    { key: 'stop', label: 'STOP', value: trade.stop, stroke: '#fb7185', dash: '5 5' },
-    { key: 'entry', label: 'ENTRY', value: trade.entry, stroke: '#38bdf8', dash: '3 5' },
-    { key: 'target', label: 'TARGET', value: trade.target, stroke: '#34d399', dash: '5 5' },
-  ] : [];
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#080f1b] p-2 sm:p-3">
-      <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Binance Demo 15 minute candlestick chart with paper trade entry, stop and target levels" className="h-auto w-full">
-        {[0, 1, 2, 3, 4].map(index => {
-          const value = maxPrice - ((maxPrice - minPrice) * index) / 4;
-          const yy = top + (plotHeight * index) / 4;
-          return (
-            <g key={`grid-${index}`}>
-              <line x1={left} x2={right} y1={yy} y2={yy} stroke="#1e293b" strokeWidth="1" strokeDasharray="3 6" />
-              <text x="884" y={yy + 3} fill="#64748b" fontSize="10">{formatPrice(value)}</text>
-            </g>
-          );
-        })}
-
-        {candles.map((candle, index) => {
-          const x = left + step * index + step / 2;
-          const rising = candle.close >= candle.open;
-          const color = rising ? '#34d399' : '#fb7185';
-          const openY = y(candle.open);
-          const closeY = y(candle.close);
-          const bodyY = Math.min(openY, closeY);
-          const bodyHeight = Math.max(2, Math.abs(closeY - openY));
-          return (
-            <g key={`${candle.time}-${index}`} className="transition-all duration-500">
-              <line x1={x} x2={x} y1={y(candle.high)} y2={y(candle.low)} stroke={color} strokeWidth="1.4" />
-              <rect x={x - bodyWidth / 2} y={bodyY} width={bodyWidth} height={bodyHeight} rx="1" fill={color} opacity="0.88" />
-              {index === candles.length - 1 && <circle cx={x} cy={y(candle.close)} r="4" fill={color} className="animate-pulse" />}
-            </g>
-          );
-        })}
-
-        {levels.map(level => (
-          <g key={level.key}>
-            <line x1={left} x2={right} y1={y(level.value)} y2={y(level.value)} stroke={level.stroke} strokeWidth="1.3" strokeDasharray={level.dash} opacity="0.95" />
-            <text x="884" y={y(level.value) - 5} fill={level.stroke} fontSize="9" fontWeight="700">{level.label}</text>
-          </g>
-        ))}
-
-        {currentPrice && currentPrice > 0 && (
-          <g>
-            <line x1={left} x2={right} y1={y(currentPrice)} y2={y(currentPrice)} stroke="#22d3ee" strokeWidth="1" strokeDasharray="2 4" opacity="0.8" />
-            <circle cx={right} cy={y(currentPrice)} r="3.5" fill="#22d3ee" className="animate-pulse" />
-            <text x="884" y={y(currentPrice) + 11} fill="#67e8f9" fontSize="9" fontWeight="700">LAST</text>
-          </g>
-        )}
-
-        <text x={left} y="318" fill="#64748b" fontSize="10">{new Date(candles[0].time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</text>
-        <text x={right} y="318" textAnchor="end" fill="#64748b" fontSize="10">{new Date(candles[candles.length - 1].time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</text>
-      </svg>
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-2 pb-1 text-[8px] font-bold uppercase tracking-wider text-slate-600">
-        <span className="flex items-center gap-1.5"><i className="h-2 w-2 rounded-sm bg-emerald-400" /> Bullish</span>
-        <span className="flex items-center gap-1.5"><i className="h-2 w-2 rounded-sm bg-rose-400" /> Bearish</span>
-        <span className="flex items-center gap-1.5"><i className="h-px w-4 bg-cyan-300" /> Latest</span>
-        {trade && <><span className="text-sky-300">Entry</span><span className="text-rose-300">Stop</span><span className="text-emerald-300">Target</span></>}
-      </div>
-    </div>
-  );
-}
-
-export function QuantAIEngine() {
-  const [signals, setSignals] = useState<Signal[]>([]);
-  const [marketCount, setMarketCount] = useState(0);
-  const [scannedCount, setScannedCount] = useState(0);
-  const [lastScanAt, setLastScanAt] = useState(0);
-  const [scanLoading, setScanLoading] = useState(false);
-  const [scanError, setScanError] = useState('');
-  const [search, setSearch] = useState('');
-  const [sort, setSort] = useState<'score' | 'confidence' | 'volume' | 'change'>('score');
-  const [selectedSymbol, setSelectedSymbol] = useState('BTCUSDT');
-
-  const [bot, setBot] = useState(false);
-  const [notional, setNotional] = useState('25');
-  const [botMessage, setBotMessage] = useState('Paused. Start the paper bot to allow one qualified simulated position at a time.');
-  const [trades, setTrades] = useState<PaperTrade[]>(loadPaperTrades);
-
-  const [candles, setCandles] = useState<Candle[]>([]);
-  const [chartLoading, setChartLoading] = useState(false);
-  const [chartError, setChartError] = useState('');
-  const [chartUpdatedAt, setChartUpdatedAt] = useState(0);
-  const [activeQuoteUpdatedAt, setActiveQuoteUpdatedAt] = useState(0);
-  const [activeQuoteError, setActiveQuoteError] = useState('');
-  const [clock, setClock] = useState(Date.now());
-
-  const scanBusy = useRef(false);
-  const processedScanAt = useRef(0);
-
-  const scan = useCallback(async () => {
-    if (scanBusy.current) return;
-    scanBusy.current = true;
-    setScanLoading(true);
-    setScanError('');
-    try {
-      const [universeResponse, scanResponse] = await Promise.all([
-        fetch('/api/quant/universe', { cache: 'no-store' }),
-        fetch('/api/quant/scan?limit=40&minVolume=250000', { cache: 'no-store' }),
-      ]);
-      const [universeData, scanData] = await Promise.all([
-        readJson(universeResponse),
-        readJson(scanResponse),
-      ]);
-      const nextSignals = Array.isArray(scanData.signals) ? scanData.signals as Signal[] : [];
-      setMarketCount(Number(universeData.count) || 0);
-      setScannedCount(Number(scanData.scannedCount) || nextSignals.length);
-      setSignals(nextSignals);
-      setLastScanAt(Date.now());
-    } catch (error) {
-      setScanError(error instanceof Error ? error.message : 'Market scan unavailable.');
-    } finally {
-      scanBusy.current = false;
-      setScanLoading(false);
-    }
-  }, []);
-
-  // The entire UI uses this one scanner. It refreshes automatically; there is
-  // deliberately no second/manual scanner button elsewhere in the dashboard.
-  useEffect(() => {
-    void scan();
-    const timer = window.setInterval(() => void scan(), bot ? 30_000 : 60_000);
-    return () => window.clearInterval(timer);
-  }, [scan, bot]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(trades.slice(0, 100)));
-    } catch {
-      // The paper journal remains available for the current page session.
-    }
-  }, [trades]);
-
-  const rows = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    const filtered = signals.filter(signal => signal.symbol.toLowerCase().includes(query));
-    return [...filtered].sort((a, b) => {
-      if (sort === 'volume') return b.quoteVolume - a.quoteVolume;
-      if (sort === 'change') return b.change24h - a.change24h;
-      if (sort === 'confidence') return b.confidence - a.confidence;
-      return Math.abs(b.score) - Math.abs(a.score);
-    });
-  }, [signals, search, sort]);
-
-  const openTrades = useMemo(() => trades.filter(trade => trade.status === 'OPEN'), [trades]);
-  const closedTrades = useMemo(() => trades.filter(trade => trade.status !== 'OPEN'), [trades]);
-  const activeTrade = openTrades[0] || null;
-  const chartSymbol = activeTrade?.symbol || selectedSymbol || signals[0]?.symbol || 'BTCUSDT';
-  const chartSignal = signals.find(signal => signal.symbol === chartSymbol) || null;
-  const currentPrice = chartSignal?.price || candles[candles.length - 1]?.close || null;
-  const activePnl = activeTrade && currentPrice ? calculateNetPnl(activeTrade, currentPrice) : null;
-
-  const buyCount = signals.filter(signal => signal.direction === 'BUY').length;
-  const sellCount = signals.filter(signal => signal.direction === 'SELL').length;
-  const realizedPnl = closedTrades.reduce((sum, trade) => sum + (trade.pnl || 0), 0);
-  const wins = closedTrades.filter(trade => (trade.pnl || 0) > 0).length;
-  const winRate = closedTrades.length ? (wins / closedTrades.length) * 100 : null;
-  const scanFresh = !!lastScanAt && clock - lastScanAt < 90_000;
-
-  // Refresh the displayed chart automatically. The current paper symbol gets
-  // the faster update cadence while a position is open.
-  useEffect(() => {
-    let cancelled = false;
-    const loadCandles = async (initial = false) => {
-      if (initial) setChartLoading(true);
-      try {
-        const response = await fetch(`/api/quant/candles/${encodeURIComponent(chartSymbol)}?limit=80`, { cache: 'no-store' });
-        const data = await readJson(response);
-        if (cancelled) return;
-        const next = Array.isArray(data.candles) ? data.candles as Candle[] : [];
-        setCandles(next);
-        setChartUpdatedAt(Date.now());
-        setChartError('');
-      } catch (error) {
-        if (!cancelled) setChartError(error instanceof Error ? error.message : 'Chart data unavailable.');
-      } finally {
-        if (!cancelled) setChartLoading(false);
-      }
-    };
-
-    void loadCandles(true);
-    const timer = window.setInterval(() => void loadCandles(false), activeTrade ? 10_000 : 30_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-    // `candles.length` is intentionally not a dependency; the chart refresh loop
-    // is controlled by the selected symbol and the active-position state only.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartSymbol, Boolean(activeTrade)]);
-
-  // Re-analyse an open symbol more frequently than the full market scan so its
-  // simulated exit and displayed P&L do not depend on its scanner rank.
-  useEffect(() => {
-    if (!activeTrade) {
-      setActiveQuoteUpdatedAt(0);
-      setActiveQuoteError('');
+  const refreshBot = useCallback(async () => {
+    if (!apiConnected) {
+      setSnapshot(previous => ({
+        ...previous,
+        status: previous.activeTrade ? 'PAUSED' : 'STOPPED',
+        message: previous.activeTrade
+          ? 'The browser API session is disconnected. The existing Binance Demo position and exchange-side SL/TP orders remain on Binance; reconnect to view live bot reconciliation.'
+          : 'Connect Binance Futures Demo to enable the autonomous bot.',
+      }));
       return;
     }
-
-    let cancelled = false;
-    const refreshActiveSymbol = async () => {
-      try {
-        const response = await fetch(`/api/quant/analyze/${encodeURIComponent(activeTrade.symbol)}`, { cache: 'no-store' });
-        const data = await readJson(response);
-        if (cancelled || !data.signal) return;
-        setSignals(previous => {
-          const withoutActive = previous.filter(item => item.symbol !== activeTrade.symbol);
-          return [data.signal as Signal, ...withoutActive]
-            .sort((a, b) => Math.abs(b.score) - Math.abs(a.score))
-            .slice(0, 40);
-        });
-        setActiveQuoteUpdatedAt(Date.now());
-        setActiveQuoteError('');
-      } catch (error) {
-        if (!cancelled) setActiveQuoteError(error instanceof Error ? error.message : 'Active price refresh failed.');
+    try {
+      const data = await api<BotSnapshot>('/api/quant/bot/state');
+      setSnapshot(data);
+      if (!settingsLoaded) {
+        setRiskPercent(String(data.config?.riskPercent ?? 0.5));
+        setMaxNotionalUsd(String(data.config?.maxNotionalUsd ?? 100));
+        setSettingsLoaded(true);
       }
-    };
-
-    void refreshActiveSymbol();
-    const timer = window.setInterval(() => void refreshActiveSymbol(), 10_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [activeTrade?.symbol]);
-
-  // Close a paper position when a fresh observed Demo quote reaches SL or TP.
-  useEffect(() => {
-    if (!signals.length) return;
-    const quoteBySymbol = new Map(signals.map(signal => [signal.symbol, signal.price]));
-    const observedAt = Date.now();
-    setTrades(previous => previous.map(trade => {
-      if (trade.status !== 'OPEN') return trade;
-      const price = quoteBySymbol.get(trade.symbol);
-      if (!price || !Number.isFinite(price) || price <= 0) return trade;
-      const hitStop = trade.side === 'BUY' ? price <= trade.stop : price >= trade.stop;
-      const hitTarget = trade.side === 'BUY' ? price >= trade.target : price <= trade.target;
-      if (!hitStop && !hitTarget) return trade;
-      return {
-        ...trade,
-        status: hitStop ? 'SL' : 'TP',
-        exitPrice: price,
-        closedAt: observedAt,
-        pnl: calculateNetPnl(trade, price),
-      };
-    }));
-  }, [signals]);
-
-  // Evaluate entries once per completed scanner refresh only. One open paper
-  // position across the whole bot, with a symbol cooldown to avoid rapid repeats.
-  useEffect(() => {
-    if (!bot || !lastScanAt || !signals.length || processedScanAt.current === lastScanAt) return;
-    processedScanAt.current = lastScanAt;
-    const observedAt = Date.now();
-    setBotMessage('Bot is running. Reviewing the latest automatic scan for a qualified setup.');
-
-    setTrades(previous => {
-      if (previous.some(trade => trade.status === 'OPEN')) return previous;
-      const lastClosedAt = previous.reduce((latest, trade) => Math.max(latest, trade.closedAt || 0), 0);
-      if (lastClosedAt && observedAt - lastClosedAt < REENTRY_PAUSE_MS) return previous;
-
-      const coolingSymbols = new Set(previous
-        .filter(trade => trade.closedAt && observedAt - trade.closedAt < COOLDOWN_MS)
-        .map(trade => trade.symbol));
-
-      const candidates = signals.filter(signal => {
-        if (signal.direction === 'NEUTRAL' || signal.price <= 0) return false;
-        if (Math.abs(signal.score) < MIN_SCORE || signal.confidence < MIN_CONFIDENCE) return false;
-        if (signal.quoteVolume < MIN_VOLUME || coolingSymbols.has(signal.symbol)) return false;
-        if (signal.volatilityPct < MIN_VOLATILITY || signal.volatilityPct > MAX_VOLATILITY) return false;
-        const stop = Number(signal.stopLoss);
-        const target = Number(signal.takeProfit);
-        if (!Number.isFinite(stop) || !Number.isFinite(target)) return false;
-
-        const isLong = signal.direction === 'BUY';
-        const levelsValid = isLong
-          ? stop < signal.price && target > signal.price
-          : target < signal.price && stop > signal.price;
-        if (!levelsValid) return false;
-
-        const risk = Math.abs(signal.price - stop);
-        const reward = Math.abs(target - signal.price);
-        const stopDistance = risk / signal.price;
-        const rewardRisk = reward / Math.max(risk, Number.EPSILON);
-        return stopDistance >= MIN_STOP_DISTANCE &&
-          stopDistance <= MAX_STOP_DISTANCE &&
-          rewardRisk >= MIN_REWARD_RISK;
-      });
-
-      candidates.sort((a, b) =>
-        (Math.abs(b.score) * 0.65 + b.confidence * 0.35) -
-        (Math.abs(a.score) * 0.65 + a.confidence * 0.35)
-      );
-
-      const candidate = candidates[0];
-      if (!candidate) {
-        return previous;
-      }
-
-      const value = clamp(Number(notional) || 25, MIN_NOTIONAL, MAX_NOTIONAL);
-      const nextTrade: PaperTrade = {
-        id: `${observedAt}-${candidate.symbol}`,
-        symbol: candidate.symbol,
-        side: candidate.direction as 'BUY' | 'SELL',
-        entry: candidate.price,
-        stop: Number(candidate.stopLoss),
-        target: Number(candidate.takeProfit),
-        notional: value,
-        status: 'OPEN',
-        openedAt: observedAt,
-      };
-      return [nextTrade, ...previous].slice(0, 100);
-    });
-  }, [bot, lastScanAt, signals, notional]);
-
-  useEffect(() => {
-    if (activeTrade) {
-      setBotMessage(`Paper position open: ${activeTrade.symbol} ${activeTrade.side}. No Binance order was sent.`);
+      setLastSyncAt(Date.now());
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Unable to load bot state.');
     }
-  }, [activeTrade?.id]);
+  }, [apiConnected, settingsLoaded]);
 
-  const toggleBot = () => {
-    if (bot) {
-      setBot(false);
-      setBotMessage('New entries paused. Any existing paper position continues to be monitored while this page is open.');
-    } else {
-      // Require a new scan after start, rather than entering from an old snapshot.
-      processedScanAt.current = lastScanAt;
-      setBot(true);
-      setBotMessage('Bot started. Waiting for the next automatic scan to find a qualified setup.');
+  useEffect(() => {
+    void refreshBot();
+    if (!apiConnected) return;
+    const timer = window.setInterval(() => void refreshBot(), 3_000);
+    return () => window.clearInterval(timer);
+  }, [apiConnected, refreshBot]);
+
+  const startBot = async () => {
+    setActionError('');
+    if (!apiConnected) {
+      onOpenApiSettings();
+      return;
+    }
+    if (!account.canTrade || Number(account.availableBalance) <= 0) {
+      setActionError('Binance Demo trading permission and positive available USDT margin must be verified before starting.');
+      return;
+    }
+    const confirmed = window.confirm(
+      'START AUTONOMOUS BINANCE FUTURES DEMO BOT?\n\nThis is not paper trading. After all checks pass, the server will submit actual MARKET entry orders to your Binance USD-M Futures DEMO account and install exchange-side stop-loss / take-profit algo orders.\n\nRisk sizing uses the Demo available balance, with a maximum 1% risk budget and a maximum notional cap of $100 at 1x leverage. Existing positions and open orders block new entries.\n\nLive Binance endpoints are not configured in this application. Continue?'
+    );
+    if (!confirmed) return;
+    setLoading(true);
+    try {
+      const data = await api<BotSnapshot>('/api/quant/bot/start', {
+        method: 'POST',
+        body: JSON.stringify({ riskPercent: Number(riskPercent), maxNotionalUsd: Number(maxNotionalUsd) }),
+      });
+      setSnapshot(data);
+      setActionError('');
+      await onRefreshAccount();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Bot could not start.');
+      await refreshBot();
+      await onRefreshAccount();
+    } finally {
+      setLoading(false);
     }
   };
 
-  const riskReward = activeTrade
-    ? Math.abs(activeTrade.target - activeTrade.entry) / Math.max(Math.abs(activeTrade.entry - activeTrade.stop), Number.EPSILON)
-    : 0;
-  const progress = activeTrade && currentPrice
-    ? activeTrade.side === 'BUY'
-      ? clamp((currentPrice - activeTrade.stop) / (activeTrade.target - activeTrade.stop), 0, 1)
-      : clamp((activeTrade.stop - currentPrice) / (activeTrade.stop - activeTrade.target), 0, 1)
-    : 0;
-  const chartAge = chartUpdatedAt ? formatAge(chartUpdatedAt, clock) : 'Waiting for chart';
-  const scannerIntervalLabel = bot ? '30s' : '60s';
+  const pauseBot = async () => {
+    setLoading(true);
+    setActionError('');
+    try {
+      const data = await api<BotSnapshot>('/api/quant/bot/stop', { method: 'POST' });
+      setSnapshot(data);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Unable to pause new entries.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const exportCsv = async (kind: 'history' | 'logs') => {
+    try {
+      const response = await fetch(`/api/quant/bot/${kind}.csv`, { credentials: 'same-origin', cache: 'no-store' });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.message || `Export failed (${response.status})`);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = kind === 'history' ? 'turboscalp-binance-demo-trades.csv' : 'turboscalp-binance-demo-activity.csv';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Export failed.');
+    }
+  };
+
+  const externalPositions = useMemo(() => positions.filter(position => Math.abs(Number(position.positionAmt || 0)) > 0), [positions]);
+  const activeTrade = snapshot.activeTrade;
+  const botOwnsSymbol = activeTrade?.symbol;
+  const unmatchedPositions = externalPositions.filter(position => position.symbol !== botOwnsSymbol);
+  const statusTone = snapshot.status === 'RUNNING'
+    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+    : snapshot.status === 'ERROR'
+      ? 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+      : snapshot.status === 'PAUSED'
+        ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+        : 'border-slate-700 bg-slate-900 text-slate-400';
+  const pnl = activeTrade?.unrealizedPnl ?? 0;
+  const protectionReady = Boolean(activeTrade?.stopAlgoId && activeTrade?.targetAlgoId);
+  const winRate = snapshot.stats.winRate === null ? '—' : `${snapshot.stats.winRate.toFixed(1)}%`;
 
   return (
-    <section className="relative space-y-5 overflow-hidden rounded-[24px] border border-slate-800 bg-[#080f1b] p-3 text-slate-100 shadow-[0_24px_80px_rgba(0,0,0,0.25)] sm:p-5 lg:p-6">
-      <div className="pointer-events-none absolute -right-24 -top-28 h-72 w-72 rounded-full bg-cyan-500/[0.06] blur-3xl" />
-
-      <div className="relative flex flex-col justify-between gap-4 border-b border-slate-800/90 pb-5 sm:flex-row sm:items-center">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="h-2 w-2 animate-pulse rounded-full bg-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.75)]" />
-            <p className="text-[8px] font-black uppercase tracking-[0.24em] text-cyan-300">Single scanner · Single chart · Paper-only execution</p>
-          </div>
-          <h2 className="mt-2 text-xl font-black tracking-tight text-white sm:text-2xl">QUANT AI LAB</h2>
-          <p className="mt-1 text-[9px] leading-relaxed text-slate-500">Binance USD-M Futures Demo market data · USDT perpetuals · 15-minute technical analysis</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-[8px] font-black tracking-wide ${scanFresh ? 'border-emerald-500/25 bg-emerald-500/[0.07] text-emerald-300' : 'border-amber-500/25 bg-amber-500/[0.07] text-amber-300'}`}>
-            <i className={`h-1.5 w-1.5 rounded-full ${scanFresh ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-            {scanLoading ? 'SCANNING' : scanFresh ? 'AUTO SCAN ACTIVE' : 'WAITING FOR SCAN'}
-          </span>
-          <span className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-[8px] font-bold text-slate-400">NEXT CYCLE · {scannerIntervalLabel}</span>
-        </div>
-      </div>
-
-      <div className="relative grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-5">
-        <Metric label="Demo markets" value={compact(marketCount)} detail="USDⓈ-M perpetual universe" />
-        <Metric label="Markets scanned" value={String(scannedCount)} detail="Latest 15m scanner pass" />
-        <Metric label="Buy signals" value={String(buyCount)} detail="EMA · RSI · MACD · volume" tone="text-emerald-300" />
-        <Metric label="Sell signals" value={String(sellCount)} detail="EMA · RSI · MACD · volume" tone="text-rose-300" />
-        <Metric label="Open paper trades" value={`${openTrades.length}/1`} detail="One position maximum" tone="text-cyan-200" />
-      </div>
-
-      {scanError && <div className="relative rounded-xl border border-rose-500/30 bg-rose-500/[0.05] p-3 text-[9px] text-rose-200">Scanner error: {scanError}</div>}
-
-      <div className="relative grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.55fr)_minmax(280px,0.75fr)]">
-        <div className="min-w-0 rounded-2xl border border-slate-800 bg-[#0b1421] p-3 sm:p-4">
-          <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+    <div className="space-y-5">
+      <section className="overflow-hidden rounded-2xl border border-cyan-500/20 bg-[#0b1422] shadow-2xl shadow-black/20">
+        <div className="flex flex-col justify-between gap-4 border-b border-slate-800 px-4 py-5 sm:flex-row sm:items-center sm:px-6">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-cyan-400/20 bg-cyan-400/10 text-cyan-200"><Bot size={22} /></div>
             <div>
-              <div className="flex items-center gap-2">
-                <h3 className="text-[10px] font-black tracking-[0.14em] text-white">DEMO PRICE CHART</h3>
-                <span className="rounded bg-slate-800 px-2 py-1 text-[7px] font-bold text-slate-400">15M CANDLES</span>
-              </div>
-              <p className="mt-1 text-[8px] text-slate-600">{chartSymbol} · Binance USD-M Futures Demo · {chartAge.toLowerCase()}</p>
-            </div>
-            <div className="text-right">
-              <p className="text-[8px] uppercase tracking-wider text-slate-600">Latest observed price</p>
-              <p className="mt-1 text-base font-black text-white">{currentPrice ? formatPrice(currentPrice) : '—'}</p>
-              {chartSignal && <p className={`mt-1 text-[8px] font-bold ${chartSignal.change24h >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{signedPercent(chartSignal.change24h)} · 24H</p>}
+              <p className="text-[8px] font-black tracking-[0.22em] text-cyan-300">QUANT AUTONOMOUS EXECUTION</p>
+              <h2 className="mt-1 text-sm font-black tracking-[0.1em] text-white">BINANCE DEMO AI BOT</h2>
+              <p className="mt-1 text-[9px] text-slate-500">One exchange position maximum · server-side monitoring · no paper trades</p>
             </div>
           </div>
-          {chartLoading && candles.length === 0 ? (
-            <div className="flex h-[300px] items-center justify-center rounded-xl border border-dashed border-slate-800 bg-[#080f1b] text-[9px] text-slate-500">Loading Demo candles…</div>
-          ) : (
-            <CandlestickChart candles={candles} trade={activeTrade?.symbol === chartSymbol ? activeTrade : null} currentPrice={currentPrice} />
-          )}
-          {chartError && <p className="mt-2 text-[8px] text-rose-300">Chart feed: {chartError}</p>}
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[8px] text-slate-600">
-            <span>Chart auto-refresh: {activeTrade ? '10 seconds' : '30 seconds'}</span>
-            <span>{chartLoading ? 'Updating chart…' : 'Automatic updates enabled'}</span>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-2 text-[9px] font-black ${statusTone}`}>
+              <span className={`h-1.5 w-1.5 rounded-full ${snapshot.status === 'RUNNING' ? 'animate-pulse bg-emerald-300' : snapshot.status === 'ERROR' ? 'bg-rose-300' : snapshot.status === 'PAUSED' ? 'bg-amber-300' : 'bg-slate-500'}`} />
+              {snapshot.status}
+            </span>
+            <span className="rounded-full border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-[8px] font-bold text-amber-200">DEMO ONLY · LIVE DISABLED</span>
           </div>
         </div>
 
-        <aside className="flex min-w-0 flex-col gap-4">
-          <div className="rounded-2xl border border-cyan-500/20 bg-[linear-gradient(145deg,rgba(8,35,49,0.65),rgba(11,20,33,0.98)_58%)] p-4 sm:p-5">
-            <div className="flex items-start justify-between gap-3">
-              <div><p className="text-[8px] font-black uppercase tracking-[0.18em] text-cyan-300">Autonomous paper engine</p><h3 className="mt-1 text-sm font-black text-white">PAPER BOT</h3></div>
-              <span className={`rounded-md border px-2 py-1 text-[8px] font-black ${bot ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-slate-700 bg-slate-900 text-slate-400'}`}>{bot ? '● RUNNING' : '○ PAUSED'}</span>
-            </div>
-            <p className="mt-3 text-[9px] leading-relaxed text-slate-400">One simulated position maximum. The bot waits for every filter to pass and never submits Binance exchange orders.</p>
-            <label className="mt-4 block text-[8px] font-bold uppercase tracking-[0.12em] text-slate-500">
-              Paper notional · USDT
-              <div className="mt-2 flex items-center gap-2 rounded-lg border border-slate-700 bg-[#070d17] px-3">
-                <span className="text-xs font-bold text-slate-500">$</span>
-                <input type="number" min={MIN_NOTIONAL} max={MAX_NOTIONAL} step="1" value={notional} disabled={bot} onChange={event => setNotional(event.target.value)} className="w-full bg-transparent py-2.5 text-xs font-bold text-white outline-none disabled:opacity-60" />
-                <span className="text-[8px] text-slate-600">5–100</span>
-              </div>
-            </label>
-            <button onClick={toggleBot} className={`mt-4 w-full rounded-xl px-4 py-3 text-[9px] font-black tracking-[0.14em] transition ${bot ? 'border border-rose-500/30 bg-rose-500/10 text-rose-300 hover:bg-rose-500/15' : 'bg-cyan-400 text-[#04111a] shadow-[0_8px_26px_rgba(34,211,238,0.12)] hover:bg-cyan-300'}`}>
-              {bot ? 'PAUSE NEW PAPER ENTRIES' : 'START AUTONOMOUS PAPER BOT →'}
-            </button>
-            <p className="mt-3 min-h-[30px] text-[8px] leading-relaxed text-slate-500">{botMessage}</p>
-            <div className="mt-3 grid grid-cols-2 gap-2 border-t border-slate-700/70 pt-3">
-              <div><p className="text-[7px] uppercase tracking-wider text-slate-600">Closed trades</p><p className="mt-1 text-lg font-black text-white">{closedTrades.length}</p></div>
-              <div><p className="text-[7px] uppercase tracking-wider text-slate-600">Win rate</p><p className="mt-1 text-lg font-black text-cyan-200">{winRate === null ? '—' : `${winRate.toFixed(1)}%`}</p></div>
-            </div>
-          </div>
+        <div className="grid grid-cols-1 gap-3 p-4 sm:grid-cols-2 lg:grid-cols-4 sm:p-5">
+          <StatCard label="Demo wallet" value={money(account.totalWalletBalance)} hint="Binance USD-M Demo" />
+          <StatCard label="Available capital" value={money(account.availableBalance)} hint="Used for risk sizing" tone="text-cyan-200" />
+          <StatCard label="Exchange unrealized P&L" value={money(account.totalUnrealizedProfit)} hint="Actual Binance positions" tone={Number(account.totalUnrealizedProfit) >= 0 ? 'text-emerald-300' : 'text-rose-300'} />
+          <StatCard label="Closed bot trades" value={String(snapshot.stats.closedTrades)} hint={`${snapshot.stats.wins} wins · ${snapshot.stats.losses} losses`} />
+        </div>
 
-          <div className="rounded-2xl border border-slate-800 bg-[#0b1421] p-4">
-            <div className="flex items-center justify-between gap-2"><h3 className="text-[9px] font-black tracking-[0.14em] text-white">ACTIVE PAPER POSITION</h3><span className="text-[7px] text-slate-600">{activeTrade ? 'MONITORING' : 'NO POSITION'}</span></div>
-            {activeTrade ? (
-              <div className="mt-3 space-y-3">
-                <div className="flex items-center justify-between gap-2"><div><p className="text-sm font-black text-white">{activeTrade.symbol}</p><p className={`mt-1 text-[8px] font-black ${activeTrade.side === 'BUY' ? 'text-emerald-300' : 'text-rose-300'}`}>{activeTrade.side === 'BUY' ? 'LONG / BUY' : 'SHORT / SELL'} · {activeTrade.notional.toFixed(2)} USDT</p></div><SignalBadge direction={activeTrade.side} /></div>
-                <div><p className="text-[8px] text-slate-600">ESTIMATED NET OPEN P&L</p><p className={`mt-1 text-2xl font-black ${activePnl === null ? 'text-slate-500' : activePnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{activePnl === null ? '—' : `${activePnl >= 0 ? '+' : ''}${formatPrice(activePnl)}`}</p></div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="rounded-lg bg-[#070d17] p-2.5"><p className="text-[7px] text-slate-600">ENTRY</p><p className="mt-1 text-[9px] font-bold text-white">{formatPrice(activeTrade.entry)}</p></div>
-                  <div className="rounded-lg bg-[#070d17] p-2.5"><p className="text-[7px] text-slate-600">CURRENT</p><p className="mt-1 text-[9px] font-bold text-cyan-200">{currentPrice ? formatPrice(currentPrice) : '—'}</p></div>
-                  <div className="rounded-lg bg-[#070d17] p-2.5"><p className="text-[7px] text-slate-600">STOP LOSS</p><p className="mt-1 text-[9px] font-bold text-rose-300">{formatPrice(activeTrade.stop)}</p></div>
-                  <div className="rounded-lg bg-[#070d17] p-2.5"><p className="text-[7px] text-slate-600">TAKE PROFIT</p><p className="mt-1 text-[9px] font-bold text-emerald-300">{formatPrice(activeTrade.target)}</p></div>
-                </div>
-                <div className="flex items-center justify-between text-[7px] font-bold uppercase tracking-wider"><span className="text-rose-300">SL</span><span className="text-slate-600">Price range to target</span><span className="text-emerald-300">TP</span></div>
-                <div className="relative h-2 overflow-hidden rounded-full bg-slate-800"><div className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-rose-500 via-amber-400 to-emerald-400 transition-all duration-700" style={{ width: `${progress * 100}%` }} /><span className="absolute top-1/2 h-4 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.9)] transition-all duration-700" style={{ left: `${progress * 100}%` }} /></div>
-                <div className="flex justify-between text-[8px]"><span className="text-rose-300">{formatPrice(activeTrade.stop)}</span><span className="font-bold text-cyan-200">R:R {riskReward.toFixed(2)} : 1</span><span className="text-emerald-300">{formatPrice(activeTrade.target)}</span></div>
-                <p className="text-[8px] leading-relaxed text-slate-600">Opened {formatTime(activeTrade.openedAt)} · quote check {activeQuoteUpdatedAt ? formatAge(activeQuoteUpdatedAt, clock).toLowerCase() : 'waiting'}{activeQuoteError ? ` · ${activeQuoteError}` : ''}</p>
+        <div className="grid gap-0 border-t border-slate-800 lg:grid-cols-[1.2fr_0.8fr]">
+          <div className="space-y-4 p-4 sm:p-5 lg:border-r lg:border-slate-800">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[9px] font-black tracking-[0.14em] text-white">AUTONOMOUS BOT CONTROL</p>
+                <p className="mt-1 text-[8px] text-slate-500">The server checks Demo positions and orders before every new entry.</p>
+              </div>
+              <ShieldCheck className="text-cyan-300" size={18} />
+            </div>
+
+            {!apiConnected ? (
+              <div className="rounded-xl border border-amber-500/20 bg-amber-500/[0.05] p-4">
+                <p className="text-[10px] font-bold text-amber-200">Binance Futures Demo is not connected.</p>
+                <p className="mt-1 text-[9px] text-slate-500">Connect your Demo API to load capital and allow the bot to place Demo exchange orders.</p>
+                <button onClick={onOpenApiSettings} className="mt-3 rounded-lg bg-cyan-400 px-4 py-2 text-[9px] font-black text-slate-950">CONNECT DEMO API</button>
               </div>
             ) : (
-              <div className="mt-3 rounded-xl border border-dashed border-slate-800 px-3 py-6 text-center"><p className="text-[10px] font-bold text-slate-300">No open paper position</p><p className="mt-2 text-[8px] leading-relaxed text-slate-600">Start the bot to let it wait for a filtered setup. It will not force an entry when conditions are weak.</p></div>
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="text-[8px] font-bold uppercase tracking-wider text-slate-500">
+                    Risk budget (% available balance)
+                    <input type="number" min="0.1" max="1" step="0.1" value={riskPercent} onChange={event => setRiskPercent(event.target.value)} disabled={snapshot.status === 'RUNNING'} className="mt-2 w-full rounded-lg border border-slate-700 bg-[#070e19] px-3 py-3 text-sm font-black text-white outline-none focus:border-cyan-400 disabled:opacity-50" />
+                  </label>
+                  <label className="text-[8px] font-bold uppercase tracking-wider text-slate-500">
+                    Maximum trade notional (USDT)
+                    <input type="number" min="5" max="100" step="5" value={maxNotionalUsd} onChange={event => setMaxNotionalUsd(event.target.value)} disabled={snapshot.status === 'RUNNING'} className="mt-2 w-full rounded-lg border border-slate-700 bg-[#070e19] px-3 py-3 text-sm font-black text-white outline-none focus:border-cyan-400 disabled:opacity-50" />
+                  </label>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-800 bg-[#080f1b] p-3">
+                  <div className="flex items-center gap-2">
+                    <Wallet size={15} className="text-cyan-300" />
+                    <div>
+                      <p className="text-[8px] font-bold text-slate-400">CAPITAL SOURCE</p>
+                      <p className="mt-1 text-[9px] font-black text-white">Binance Demo available balance · {money(account.availableBalance)}</p>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-[8px] font-bold text-slate-500">LEVERAGE</p>
+                    <p className="mt-1 text-[9px] font-black text-cyan-200">1× fixed</p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {snapshot.status === 'RUNNING' ? (
+                    <button onClick={() => void pauseBot()} disabled={loading} className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-[9px] font-black text-amber-200 disabled:opacity-50">
+                      <Pause size={14} /> {activeTrade ? 'PAUSE NEW ENTRIES · KEEP SL/TP' : 'PAUSE BOT'}
+                    </button>
+                  ) : (
+                    <button onClick={() => void startBot()} disabled={loading || accountLoading || !account.canTrade || Number(account.availableBalance) <= 0} className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg bg-cyan-400 px-4 py-3 text-[9px] font-black text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40">
+                      {loading ? <RefreshCw className="animate-spin" size={14} /> : <Play size={14} />}
+                      {snapshot.activeTrade || snapshot.status === 'PAUSED' ? 'RESUME / RECONCILE BOT' : 'START AUTONOMOUS DEMO BOT'}
+                    </button>
+                  )}
+                  <button onClick={() => { void refreshBot(); void onRefreshAccount(); }} disabled={loading || accountLoading} className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-3 text-[9px] font-black text-slate-300 disabled:opacity-50">
+                    <RefreshCw size={13} className={accountLoading ? 'animate-spin' : ''} /> SYNC
+                  </button>
+                </div>
+              </>
             )}
-          </div>
-        </aside>
-      </div>
 
-      <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-[#0b1421]">
-        <div className="flex flex-col justify-between gap-3 border-b border-slate-800 p-4 sm:flex-row sm:items-center sm:px-5">
-          <div><div className="flex items-center gap-2"><h3 className="text-[10px] font-black tracking-[0.14em] text-white">MARKET SCANNER</h3><span className="rounded bg-slate-800 px-2 py-1 text-[7px] font-bold text-slate-400">{rows.length} RESULTS</span></div><p className="mt-1 text-[8px] text-slate-600">Single 15-minute scanner · click a market to load its chart</p></div>
-          <div className="flex gap-2">
-            <input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search pair…" className="min-w-0 w-full rounded-lg border border-slate-700 bg-[#070d17] px-3 py-2 text-[9px] text-white outline-none placeholder:text-slate-600 focus:border-cyan-500/60 sm:w-36" />
-            <select value={sort} onChange={event => setSort(event.target.value as typeof sort)} className="rounded-lg border border-slate-700 bg-[#070d17] px-2 py-2 text-[9px] text-slate-300 outline-none focus:border-cyan-500/60"><option value="score">Score</option><option value="confidence">Confidence</option><option value="volume">Volume</option><option value="change">24h</option></select>
+            <div className="rounded-lg border border-slate-800/80 bg-[#080f1b] px-3 py-3">
+              <p className="text-[9px] leading-relaxed text-slate-300">{snapshot.message}</p>
+              <p className="mt-2 text-[8px] text-slate-600">{snapshot.lastScanAt ? `Last strategy scan: ${time(snapshot.lastScanAt)} · ${snapshot.lastScanCount} signals received` : 'Waiting for first automatic strategy scan.'}</p>
+            </div>
+            {actionError && <p className="rounded-lg border border-rose-500/20 bg-rose-500/[0.05] p-3 text-[9px] text-rose-300">{actionError}</p>}
+            {accountError && <p className="rounded-lg border border-rose-500/20 bg-rose-500/[0.05] p-3 text-[9px] text-rose-300">Account sync: {accountError}</p>}
+          </div>
+
+          <div className="space-y-4 p-4 sm:p-5">
+            <div className="flex items-center justify-between">
+              <p className="text-[9px] font-black tracking-[0.14em] text-white">RISK & PERFORMANCE</p>
+              <Activity size={16} className="text-cyan-300" />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <StatCard label="Win rate" value={winRate} hint="Closed bot trades only" tone={snapshot.stats.winRate !== null && snapshot.stats.winRate >= 50 ? 'text-emerald-300' : 'text-white'} />
+              <StatCard label="Net realized P&L" value={money(snapshot.stats.netRealizedPnl)} hint="Exchange income records" tone={snapshot.stats.netRealizedPnl >= 0 ? 'text-emerald-300' : 'text-rose-300'} />
+            </div>
+            <div className="space-y-2 rounded-xl border border-slate-800 bg-[#080f1b] p-3">
+              <div className="flex items-center justify-between text-[8px]"><span className="text-slate-500">Strategy timeframe</span><b className="text-slate-200">15-minute candles</b></div>
+              <div className="flex items-center justify-between text-[8px]"><span className="text-slate-500">Scan cycle</span><b className="text-slate-200">Every 30 seconds</b></div>
+              <div className="flex items-center justify-between text-[8px]"><span className="text-slate-500">Exchange reconciliation</span><b className="text-slate-200">Every 5 seconds</b></div>
+              <div className="flex items-center justify-between text-[8px]"><span className="text-slate-500">Duplicate protection</span><b className="text-emerald-300">One open position max</b></div>
+              <div className="flex items-center justify-between text-[8px]"><span className="text-slate-500">SL / TP protection</span><b className="text-emerald-300">Exchange-side algo orders</b></div>
+            </div>
+            <p className="text-[8px] leading-relaxed text-slate-600">Signal score and confidence are rule-based heuristics, not statistically proven win probabilities. The bot does not guarantee returns. Keep the account in Demo mode and review results before considering any other environment.</p>
           </div>
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[740px] text-left text-[9px]">
-            <thead className="bg-[#080f1b] text-[7px] font-bold uppercase tracking-[0.13em] text-slate-600"><tr><th className="px-4 py-3">Market</th><th className="px-3 py-3">Price</th><th className="px-3 py-3">24h</th><th className="px-3 py-3">Quote volume</th><th className="px-3 py-3">RSI</th><th className="px-3 py-3">Score</th><th className="px-3 py-3">Signal</th><th className="px-4 py-3 text-right">Chart</th></tr></thead>
-            <tbody>
-              {rows.map(signal => (
-                <tr key={signal.symbol} onClick={() => setSelectedSymbol(signal.symbol)} className={`cursor-pointer border-t border-slate-800/70 transition hover:bg-cyan-500/[0.04] ${chartSymbol === signal.symbol ? 'bg-cyan-500/[0.04]' : ''}`}>
-                  <td className="whitespace-nowrap px-4 py-3"><p className="font-black text-white">{signal.symbol}</p><p className="mt-1 text-[7px] text-slate-600">{Number(signal.confidence || 0).toFixed(0)} heuristic confidence</p></td>
-                  <td className="whitespace-nowrap px-3 py-3 font-bold text-slate-200">{formatPrice(signal.price)}</td>
-                  <td className={`whitespace-nowrap px-3 py-3 font-bold ${signal.change24h >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{signedPercent(signal.change24h)}</td>
-                  <td className="whitespace-nowrap px-3 py-3 text-slate-400">{compact(signal.quoteVolume)}</td>
-                  <td className="px-3 py-3 text-slate-400">{Number(signal.rsi || 0).toFixed(1)}</td>
-                  <td className="px-3 py-3"><p className="font-black text-slate-200">{signal.score > 0 ? '+' : ''}{signal.score}</p><div className="mt-1 h-1 w-16 overflow-hidden rounded-full bg-slate-800"><div className={`h-full rounded-full ${signal.direction === 'BUY' ? 'bg-emerald-400' : signal.direction === 'SELL' ? 'bg-rose-400' : 'bg-slate-500'}`} style={{ width: `${clamp(Math.abs(signal.score), 0, 100)}%` }} /></div></td>
-                  <td className="px-3 py-3"><SignalBadge direction={signal.direction} /></td>
-                  <td className="whitespace-nowrap px-4 py-3 text-right"><span className="text-[8px] font-bold text-cyan-300">{chartSymbol === signal.symbol ? 'SELECTED' : 'VIEW CHART ↗'}</span></td>
-                </tr>
-              ))}
-              {!rows.length && <tr><td colSpan={8} className="px-4 py-10 text-center text-[9px] text-slate-500">{scanLoading ? 'Scanning Demo markets…' : 'No matching signals found.'}</td></tr>}
-            </tbody>
-          </table>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800 px-4 py-3 text-[8px] text-slate-600"><span>{formatAge(lastScanAt, clock)}</span><span>Automatic scan every {scannerIntervalLabel} · no duplicate scanner</span><span>15m technical signals · not predictions</span></div>
-      </div>
+      </section>
 
-      <div className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0b1421]">
+      <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0b1422]">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-4 py-4 sm:px-5">
-          <div><h3 className="text-[10px] font-black tracking-[0.14em] text-white">PAPER TRADE JOURNAL</h3><p className="mt-1 text-[8px] text-slate-600">Saved in this browser · latest 100 simulated trades</p></div>
-          <div className="flex items-center gap-3 text-[8px]"><span className="text-slate-500">{trades.length} records</span><span className={`font-bold ${realizedPnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{realizedPnl >= 0 ? '+' : ''}{formatPrice(realizedPnl)} realized</span></div>
+          <div>
+            <p className="text-[9px] font-black tracking-[0.14em] text-white">ACTIVE BINANCE DEMO POSITION</p>
+            <p className="mt-1 text-[8px] text-slate-500">Exchange position risk and protective-order monitoring</p>
+          </div>
+          <span className="rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 text-[8px] font-bold text-slate-400">{externalPositions.length} EXCHANGE POSITION{externalPositions.length === 1 ? '' : 'S'} · {openOrders.length} OPEN ORDERS</span>
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-left text-[8px]">
-            <thead className="bg-[#080f1b] text-[7px] font-bold uppercase tracking-[0.12em] text-slate-600"><tr><th className="px-4 py-3">Opened</th><th className="px-3 py-3">Market</th><th className="px-3 py-3">Side</th><th className="px-3 py-3">Entry</th><th className="px-3 py-3">Exit / current</th><th className="px-3 py-3">Notional</th><th className="px-4 py-3 text-right">Result</th></tr></thead>
-            <tbody>
-              {trades.slice(0, 12).map(trade => {
-                const isOpen = trade.status === 'OPEN';
-                const mark = isOpen && trade.symbol === activeTrade?.symbol ? currentPrice : null;
-                const pnl = isOpen ? (mark ? calculateNetPnl(trade, mark) : null) : trade.pnl ?? 0;
-                return (
-                  <tr key={trade.id} className="border-t border-slate-800/70">
-                    <td className="whitespace-nowrap px-4 py-3 text-slate-500">{formatTime(trade.openedAt)}</td>
-                    <td className="whitespace-nowrap px-3 py-3 font-black text-white">{trade.symbol}</td>
-                    <td className={`px-3 py-3 font-black ${trade.side === 'BUY' ? 'text-emerald-300' : 'text-rose-300'}`}>{trade.side}</td>
-                    <td className="whitespace-nowrap px-3 py-3 text-slate-300">{formatPrice(trade.entry)}</td>
-                    <td className="whitespace-nowrap px-3 py-3 text-slate-300">{trade.exitPrice ? formatPrice(trade.exitPrice) : isOpen && mark ? formatPrice(mark) : '—'}</td>
-                    <td className="whitespace-nowrap px-3 py-3 text-slate-400">{trade.notional.toFixed(2)} USDT</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right">{isOpen ? <span className="font-bold text-amber-300">OPEN{pnl === null ? '' : ` · ${pnl >= 0 ? '+' : ''}${formatPrice(pnl)}`}</span> : <span className={`font-bold ${(pnl || 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{trade.status} · {(pnl || 0) >= 0 ? '+' : ''}{formatPrice(pnl || 0)}</span>}</td>
-                  </tr>
-                );
-              })}
-              {!trades.length && <tr><td colSpan={7} className="px-4 py-8 text-center text-[9px] text-slate-500">No paper trades yet. The journal will update when a qualified setup is simulated.</td></tr>}
-            </tbody>
-          </table>
-        </div>
-      </div>
 
-      <div className="flex flex-col justify-between gap-2 border-t border-slate-800/80 pt-4 text-[8px] leading-relaxed text-slate-600 sm:flex-row">
-        <p className="max-w-4xl">Model note: score and confidence are technical heuristics, not verified win probabilities. Paper P&L includes an estimated 0.08% round-trip fee. Funding, spread, slippage and order execution latency are not simulated. Data refresh and paper monitoring require this browser page to remain open.</p>
-        <p className="shrink-0 font-bold uppercase tracking-wider text-slate-500">No exchange orders · Local paper journal</p>
-      </div>
-    </section>
+        {activeTrade ? (
+          <div className="p-4 sm:p-5">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <h3 className="text-lg font-black text-white">{activeTrade.symbol}</h3>
+                  <span className={`rounded-md px-2 py-1 text-[8px] font-black ${activeTrade.side === 'BUY' ? 'bg-emerald-500/10 text-emerald-300' : 'bg-rose-500/10 text-rose-300'}`}>{activeTrade.side === 'BUY' ? 'LONG / BUY' : 'SHORT / SELL'}</span>
+                  <span className="rounded-md border border-emerald-500/20 bg-emerald-500/[0.05] px-2 py-1 text-[8px] font-black text-emerald-300">ON BINANCE DEMO</span>
+                </div>
+                <p className="mt-1 text-[8px] text-slate-500">Order ID {activeTrade.entryOrderId ?? '—'} · opened {time(activeTrade.openedAt)}</p>
+              </div>
+              <div className="text-right">
+                <p className="text-[8px] font-bold tracking-wider text-slate-500">EXCHANGE UNREALIZED P&L</p>
+                <p className={`mt-1 text-xl font-black ${pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{money(pnl, 4)}</p>
+              </div>
+            </div>
+
+            <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <StatCard label="Notional" value={money(activeTrade.notionalUsd)} hint={`${activeTrade.leverage}× leverage`} />
+              <StatCard label="Entry fill" value={price(activeTrade.entryPrice)} hint={`${activeTrade.quantity} quantity`} />
+              <StatCard label="Mark price" value={price(activeTrade.markPrice)} hint="From Binance positionRisk" tone="text-cyan-200" />
+              <StatCard label="Stop / Target" value={protectionReady ? 'PROTECTED' : 'VERIFYING'} hint="Binance conditional algo orders" tone={protectionReady ? 'text-emerald-300' : 'text-amber-200'} />
+            </div>
+
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <div className="rounded-xl border border-rose-500/20 bg-rose-500/[0.045] p-3">
+                <div className="flex items-center justify-between"><span className="text-[8px] font-black tracking-wider text-rose-300">STOP LOSS</span><ArrowDownRight size={14} className="text-rose-300" /></div>
+                <p className="mt-2 text-base font-black text-white">{price(activeTrade.stopPrice)}</p>
+                <p className="mt-1 text-[8px] text-slate-500">Exchange-side STOP_MARKET protection</p>
+              </div>
+              <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.045] p-3">
+                <div className="flex items-center justify-between"><span className="text-[8px] font-black tracking-wider text-emerald-300">TAKE PROFIT</span><ArrowUpRight size={14} className="text-emerald-300" /></div>
+                <p className="mt-2 text-base font-black text-white">{price(activeTrade.targetPrice)}</p>
+                <p className="mt-1 text-[8px] text-slate-500">Exchange-side TAKE_PROFIT_MARKET protection</p>
+              </div>
+            </div>
+          </div>
+        ) : externalPositions.length ? (
+          <div className="space-y-2 p-4 sm:p-5">
+            <div className="flex items-center gap-2 text-amber-200"><AlertTriangle size={16} /><p className="text-[9px] font-black">UNTRACKED EXCHANGE POSITION DETECTED</p></div>
+            {externalPositions.map((position, index) => (
+              <div key={`${position.symbol}-${index}`} className="flex flex-wrap justify-between gap-2 rounded-lg border border-amber-500/20 bg-amber-500/[0.04] p-3 text-[9px]">
+                <b className="text-white">{position.symbol} · {Number(position.positionAmt) > 0 ? 'LONG' : 'SHORT'}</b>
+                <span className="text-slate-400">Qty {position.positionAmt} · Entry {price(position.entryPrice)} · Mark {price(position.markPrice)}</span>
+              </div>
+            ))}
+            <p className="text-[8px] text-amber-200/80">The autonomous bot will not create another position while an untracked Binance position exists. Reconcile or close it on Binance Demo before starting.</p>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center px-5 py-10 text-center">
+            <div className="flex h-11 w-11 items-center justify-center rounded-full border border-slate-700 bg-slate-900 text-slate-500"><Clock3 size={19} /></div>
+            <p className="mt-3 text-[10px] font-bold text-slate-300">No active Binance Demo bot position</p>
+            <p className="mt-1 max-w-md text-[8px] leading-relaxed text-slate-500">When a setup passes the rules, the bot submits one Demo market order and confirms its exchange-side stop-loss and take-profit orders.</p>
+          </div>
+        )}
+      </section>
+
+      <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0b1422]">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-4 py-4 sm:px-5">
+          <div>
+            <p className="text-[9px] font-black tracking-[0.14em] text-white">BINANCE DEMO TRADE HISTORY</p>
+            <p className="mt-1 text-[8px] text-slate-500">Actual bot exchange orders, fills and reconciled P&L · {snapshot.trades.length} recent records</p>
+          </div>
+          <button onClick={() => void exportCsv('history')} disabled={!apiConnected || !snapshot.trades.length} className="inline-flex items-center gap-2 rounded-lg border border-cyan-400/20 bg-cyan-400/[0.06] px-3 py-2 text-[8px] font-black text-cyan-200 disabled:opacity-40"><Download size={13} /> EXPORT TRADES CSV</button>
+        </div>
+        {snapshot.trades.length ? (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[850px] text-left text-[8px]">
+              <thead className="bg-[#080f1b] text-slate-500"><tr>{['OPENED','SYMBOL','SIDE','NOTIONAL','ENTRY','SL','TP','STATUS','REALIZED P&L'].map(title => <th key={title} className="px-4 py-3 font-bold">{title}</th>)}</tr></thead>
+              <tbody>
+                {snapshot.trades.map(trade => (
+                  <tr key={trade.id} className="border-t border-slate-800/80 hover:bg-slate-800/20">
+                    <td className="whitespace-nowrap px-4 py-3 text-slate-500">{time(trade.openedAt)}</td>
+                    <td className="px-4 py-3 font-black text-white">{trade.symbol}</td>
+                    <td className={`px-4 py-3 font-bold ${trade.side === 'BUY' ? 'text-emerald-300' : 'text-rose-300'}`}>{trade.side}</td>
+                    <td className="px-4 py-3 text-slate-300">{money(trade.notionalUsd)}</td>
+                    <td className="px-4 py-3 text-slate-300">{price(trade.entryPrice)}</td>
+                    <td className="px-4 py-3 text-rose-300">{price(trade.stopPrice)}</td>
+                    <td className="px-4 py-3 text-emerald-300">{price(trade.targetPrice)}</td>
+                    <td className="px-4 py-3"><span className={`rounded px-2 py-1 font-black ${trade.status === 'OPEN' ? 'bg-cyan-500/10 text-cyan-200' : 'bg-slate-800 text-slate-400'}`}>{trade.status}</span></td>
+                    <td className={`px-4 py-3 font-bold ${trade.realizedPnl === null ? 'text-slate-500' : trade.realizedPnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>{trade.realizedPnl === null ? (trade.status === 'OPEN' ? '—' : 'Not reconciled') : money(trade.realizedPnl, 4)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : <p className="px-5 py-8 text-center text-[9px] text-slate-500">No Binance Demo bot trades have been recorded yet.</p>}
+      </section>
+
+      <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0b1422]">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-4 py-4 sm:px-5">
+          <div>
+            <p className="text-[9px] font-black tracking-[0.14em] text-white">AUTOMATION ACTIVITY LOG</p>
+            <p className="mt-1 text-[8px] text-slate-500">Pre-flight checks, scanner decisions, exchange orders and position reconciliation</p>
+          </div>
+          <button onClick={() => void exportCsv('logs')} disabled={!apiConnected || !snapshot.logs.length} className="inline-flex items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-[8px] font-black text-slate-300 disabled:opacity-40"><Download size={13} /> EXPORT LOG CSV</button>
+        </div>
+        <div className="max-h-80 divide-y divide-slate-800/70 overflow-y-auto">
+          {snapshot.logs.length ? snapshot.logs.map((event, index) => (
+            <div key={`${event.at}-${index}`} className="grid grid-cols-[105px_52px_1fr] gap-3 px-4 py-3 text-[8px] sm:grid-cols-[145px_60px_1fr]">
+              <span className="text-slate-600">{time(event.at)}</span>
+              <span className={`font-black ${event.level === 'ERROR' ? 'text-rose-300' : event.level === 'WARN' ? 'text-amber-300' : event.level === 'TRADE' ? 'text-emerald-300' : 'text-cyan-300'}`}>{event.level}</span>
+              <span className="leading-relaxed text-slate-300">{event.message}</span>
+            </div>
+          )) : <p className="px-5 py-8 text-center text-[9px] text-slate-500">Activity will appear here when the bot connects and starts checking exchange data.</p>}
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-amber-500/20 bg-amber-500/[0.045] px-4 py-3">
+        <div className="flex items-start gap-2"><CheckCircle2 size={15} className="mt-0.5 shrink-0 text-amber-300" /><div>
+          <p className="text-[9px] font-black text-amber-200">IMPORTANT EXECUTION SAFETY</p>
+          <p className="mt-1 text-[8px] leading-relaxed text-slate-400">This bot submits actual orders to Binance USD-M Futures DEMO only. It requires One-way Position Mode, checks positions and both regular / conditional open orders before entering, and allows one open position at a time. Pausing stops new entries; an existing position remains protected by Binance-side SL/TP orders. Do not manually trade the same Demo account while the bot is managing a position. The AI score is a heuristic and is not a guaranteed win rate.</p>
+        </div></div>
+        {unmatchedPositions.length > 0 && <p className="mt-2 text-[8px] font-bold text-amber-200">Untracked exchange positions: {unmatchedPositions.map(position => position.symbol).join(', ')}</p>}
+        <p className="mt-2 text-[8px] text-slate-600">Bot state sync {lastSyncAt ? time(lastSyncAt) : 'pending'} · Account refresh {accountLoading ? 'in progress' : 'every 30 seconds'} · Open-order panel includes regular and conditional orders when server integration is installed.</p>
+      </section>
+    </div>
   );
 }
