@@ -710,7 +710,7 @@ async function calculateDemoOrder(input: any) {
 
   return {
     symbol,
-    side,
+    side: side as 'BUY' | 'SELL',
     leverage,
     quantity,
     price,
