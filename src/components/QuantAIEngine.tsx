@@ -1,9 +1,19 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Activity, AlertTriangle, ArrowDownRight, ArrowUpRight,
-  Bot, CheckCircle2, Clock3, Download, Pause, Play,
-  RefreshCw, ShieldCheck, Wallet
+  Activity,
+  AlertTriangle,
+  ArrowDownRight,
+  ArrowUpRight,
+  Bot,
+  CheckCircle2,
+  Clock3,
+  Download,
+  Pause,
+  Play,
+  RefreshCw,
+  ShieldCheck,
+  Wallet
 } from 'lucide-react';
 
 type AccountSummary = {
@@ -117,6 +127,7 @@ const INITIAL: BotSnapshot = {
 function money(value: unknown, digits = 2) {
   const n = Number(value);
   if (!Number.isFinite(n)) return '—';
+
   return n.toLocaleString('en-US', {
     style: 'currency',
     currency: 'USD',
@@ -128,8 +139,10 @@ function money(value: unknown, digits = 2) {
 function price(value: unknown) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return '—';
-  return n < 1 ? `$${n.toPrecision(6)}` :
-    `$${n.toLocaleString('en-US', { maximumFractionDigits: 5 })}`;
+
+  return n < 1
+    ? `$${n.toPrecision(6)}`
+    : `$${n.toLocaleString('en-US', { maximumFractionDigits: 5 })}`;
 }
 
 function date(value: number | null | undefined) {
@@ -154,7 +167,9 @@ async function request<T>(
 
   if (!response.ok || result.success === false) {
     throw new Error(
-      result.message || result.error || `Request failed (${response.status})`
+      result.message ||
+      result.error ||
+      `Request failed (${response.status})`
     );
   }
 
@@ -227,7 +242,9 @@ export function QuantAIEngine({
       setLastSync(Date.now());
       setError('');
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Bot status unavailable.');
+      setError(
+        e instanceof Error ? e.message : 'Bot status unavailable.'
+      );
     }
   }, [apiConnected, settingsLoaded]);
 
@@ -237,7 +254,9 @@ export function QuantAIEngine({
 
     const sync = async () => {
       if (!active || busy) return;
+
       busy = true;
+
       try {
         await refreshBot();
       } finally {
@@ -248,7 +267,10 @@ export function QuantAIEngine({
     void sync();
 
     if (apiConnected) {
-      const timer = window.setInterval(() => void sync(), 3000);
+      const timer = window.setInterval(() => {
+        void sync();
+      }, 3000);
+
       return () => {
         active = false;
         window.clearInterval(timer);
@@ -261,15 +283,32 @@ export function QuantAIEngine({
   }, [apiConnected, refreshBot]);
 
   const startBot = async () => {
+    if (loading) return;
+
     setError('');
 
     if (!apiConnected) {
+      setError('Binance Demo is not connected. Connect your Demo API first.');
       onOpenApiSettings();
       return;
     }
 
-    if (!account.canTrade || Number(account.availableBalance) <= 0) {
-      setError('Binance Demo trading permission and available margin must be verified.');
+    if (accountLoading) {
+      setError('Account information is still loading. Please try again.');
+      return;
+    }
+
+    if (!account.canTrade) {
+      setError(
+        'Binance Demo reports that trading is disabled. Check API permissions.'
+      );
+      return;
+    }
+
+    if (Number(account.availableBalance) <= 0) {
+      setError(
+        'No available Binance Demo margin. Check your Demo Futures wallet.'
+      );
       return;
     }
 
@@ -281,19 +320,23 @@ export function QuantAIEngine({
       return;
     }
 
-    if (!Number.isFinite(notionalValue) || notionalValue < 5 || notionalValue > 100) {
+    if (
+      !Number.isFinite(notionalValue) ||
+      notionalValue < 5 ||
+      notionalValue > 100
+    ) {
       setError('Maximum notional must be between 5 and 100 USDT.');
       return;
     }
 
     const confirmed = window.confirm(
       'START BINANCE USD-M FUTURES DEMO BOT?\n\n' +
-      'This bot is configured for Demo exchange orders, not paper trades. ' +
-      'It may submit actual Demo MARKET orders and protective SL/TP orders.\n\n' +
+      'This bot may submit actual Binance Demo orders.\n' +
+      'It does not use the Live Trading account.\n\n' +
       'Maximum notional: ' + notionalValue + ' USDT\n' +
       'Risk budget: ' + riskValue + '%\n' +
       'Leverage: 1x\n\n' +
-      'Confirm that you want to start.'
+      'Do you want to continue?'
     );
 
     if (!confirmed) return;
@@ -313,10 +356,15 @@ export function QuantAIEngine({
       );
 
       setBot(data);
+      setError('');
+
       await onRefreshAccount();
       await refreshBot();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to start bot.');
+      setError(
+        e instanceof Error ? e.message : 'Unable to start bot.'
+      );
+
       await refreshBot();
       await onRefreshAccount();
     } finally {
@@ -325,6 +373,8 @@ export function QuantAIEngine({
   };
 
   const pauseBot = async () => {
+    if (loading) return;
+
     setLoading(true);
     setError('');
 
@@ -337,7 +387,9 @@ export function QuantAIEngine({
       setBot(data);
       await onRefreshAccount();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to pause bot.');
+      setError(
+        e instanceof Error ? e.message : 'Unable to pause bot.'
+      );
     } finally {
       setLoading(false);
     }
@@ -347,7 +399,10 @@ export function QuantAIEngine({
     try {
       const response = await fetch(
         `/api/quant/bot/${kind}.csv`,
-        { credentials: 'same-origin', cache: 'no-store' }
+        {
+          credentials: 'same-origin',
+          cache: 'no-store'
+        }
       );
 
       if (!response.ok) {
@@ -402,7 +457,6 @@ export function QuantAIEngine({
   return (
     <div className="space-y-5">
 
-      {/* MAIN ENGINE */}
       <section className="overflow-hidden rounded-2xl border border-cyan-500/20 bg-[#0b1422]">
 
         <header className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 p-5">
@@ -410,6 +464,7 @@ export function QuantAIEngine({
             <div className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 p-3 text-cyan-300">
               <Bot size={24} />
             </div>
+
             <div>
               <p className="text-[9px] font-black tracking-widest text-cyan-300">
                 QUANT AUTONOMOUS ENGINE
@@ -460,8 +515,8 @@ export function QuantAIEngine({
 
         <div className="grid gap-5 border-t border-slate-800 p-5 lg:grid-cols-2">
 
-          {/* CONTROLS */}
           <div className="space-y-4">
+
             <div className="flex items-center justify-between">
               <p className="text-[10px] font-black tracking-widest text-white">
                 ENGINE CONTROL
@@ -474,9 +529,11 @@ export function QuantAIEngine({
                 <p className="text-sm font-bold text-amber-200">
                   Binance Demo not connected
                 </p>
+
                 <button
+                  type="button"
                   onClick={onOpenApiSettings}
-                  className="mt-3 rounded-lg bg-cyan-400 px-4 py-3 text-[9px] font-black text-slate-950"
+                  className="mt-3 cursor-pointer rounded-lg bg-cyan-400 px-4 py-3 text-[9px] font-black text-slate-950"
                 >
                   CONNECT DEMO API
                 </button>
@@ -484,6 +541,7 @@ export function QuantAIEngine({
             ) : (
               <>
                 <div className="grid grid-cols-2 gap-3">
+
                   <label className="text-[9px] text-slate-400">
                     RISK (%)
                     <input
@@ -492,7 +550,7 @@ export function QuantAIEngine({
                       max="1"
                       step="0.1"
                       value={risk}
-                      disabled={bot.status === 'RUNNING'}
+                      disabled={bot.status === 'RUNNING' || loading}
                       onChange={e => setRisk(e.target.value)}
                       className="mt-2 w-full rounded-lg border border-slate-700 bg-[#070e19] p-3 text-sm font-bold text-white"
                     />
@@ -506,11 +564,12 @@ export function QuantAIEngine({
                       max="100"
                       step="5"
                       value={notional}
-                      disabled={bot.status === 'RUNNING'}
+                      disabled={bot.status === 'RUNNING' || loading}
                       onChange={e => setNotional(e.target.value)}
                       className="mt-2 w-full rounded-lg border border-slate-700 bg-[#070e19] p-3 text-sm font-bold text-white"
                     />
                   </label>
+
                 </div>
 
                 <div className="flex items-center justify-between rounded-xl border border-slate-800 bg-[#080f1b] p-4">
@@ -523,6 +582,7 @@ export function QuantAIEngine({
                       </p>
                     </div>
                   </div>
+
                   <div className="text-right">
                     <p className="text-[8px] text-slate-500">LEVERAGE</p>
                     <p className="text-sm font-black text-cyan-300">1x</p>
@@ -530,47 +590,62 @@ export function QuantAIEngine({
                 </div>
 
                 <div className="flex gap-2">
+
                   {bot.status === 'RUNNING' ? (
                     <button
+                      type="button"
                       onClick={() => void pauseBot()}
                       disabled={loading}
-                      className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-[9px] font-black text-amber-200 disabled:opacity-40"
+                      className="relative z-10 flex flex-1 cursor-pointer items-center justify-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-[9px] font-black text-amber-200 disabled:opacity-40"
                     >
-                      <Pause size={15} />
+                      {loading
+                        ? <RefreshCw size={15} className="animate-spin" />
+                        : <Pause size={15} />
+                      }
                       PAUSE NEW ENTRIES
                     </button>
                   ) : (
                     <button
+                      type="button"
+                      aria-label="Start or resume Binance Demo autonomous bot"
                       onClick={() => void startBot()}
-                      disabled={
-                        loading ||
-                        accountLoading ||
-                        !account.canTrade ||
-                        Number(account.availableBalance) <= 0
+                      disabled={loading || accountLoading}
+                      title={
+                        !account.canTrade
+                          ? 'Click to check Binance Demo trading permissions.'
+                          : Number(account.availableBalance) <= 0
+                            ? 'Click to check available Demo margin.'
+                            : 'Start or resume the Binance Demo autonomous bot.'
                       }
-                      className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-cyan-400 p-4 text-[9px] font-black text-slate-950 hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="relative z-10 flex flex-1 cursor-pointer touch-manipulation items-center justify-center gap-2 rounded-lg bg-cyan-400 p-4 text-[9px] font-black text-slate-950 hover:bg-cyan-300 disabled:cursor-wait disabled:opacity-40"
                     >
                       {loading
                         ? <RefreshCw size={15} className="animate-spin" />
                         : <Play size={15} />
                       }
-                      {bot.status === 'PAUSED'
-                        ? 'RESUME / RECONCILE'
-                        : 'START AUTONOMOUS BOT'
+
+                      {loading
+                        ? 'STARTING...'
+                        : bot.status === 'PAUSED'
+                          ? 'RESUME / RECONCILE'
+                          : 'START AUTONOMOUS BOT'
                       }
                     </button>
                   )}
 
                   <button
+                    type="button"
+                    aria-label="Refresh bot and account"
                     onClick={() => {
                       void refreshBot();
                       void onRefreshAccount();
                     }}
                     disabled={loading || accountLoading}
-                    className="rounded-lg border border-slate-700 bg-slate-900 px-4 text-slate-300"
+                    className="cursor-pointer rounded-lg border border-slate-700 bg-slate-900 px-4 text-slate-300 disabled:opacity-40"
                   >
                     <RefreshCw size={15} />
                   </button>
+
                 </div>
               </>
             )}
@@ -579,15 +654,20 @@ export function QuantAIEngine({
               <p className="text-[9px] leading-relaxed text-slate-300">
                 {bot.message}
               </p>
+
               <p className="mt-2 text-[8px] text-slate-500">
                 Last scan: {date(bot.lastScanAt)} · {bot.lastScanCount} signals
               </p>
             </div>
 
             {error && (
-              <p className="rounded-lg border border-rose-500/20 bg-rose-500/10 p-3 text-[9px] text-rose-300">
-                {error}
-              </p>
+              <div
+                role="alert"
+                className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-[9px] text-rose-300"
+              >
+                <b>BOT ERROR</b>
+                <p className="mt-1">{error}</p>
+              </div>
             )}
 
             {accountError && (
@@ -595,10 +675,11 @@ export function QuantAIEngine({
                 Account: {accountError}
               </p>
             )}
+
           </div>
 
-          {/* PERFORMANCE */}
           <div className="space-y-4">
+
             <div className="flex items-center justify-between">
               <p className="text-[10px] font-black tracking-widest text-white">
                 PERFORMANCE
@@ -613,6 +694,7 @@ export function QuantAIEngine({
                 hint="Closed trades"
                 color="text-emerald-300"
               />
+
               <Stat
                 label="Realized P&L"
                 value={money(bot.stats.netRealizedPnl, 4)}
@@ -622,39 +704,45 @@ export function QuantAIEngine({
             </div>
 
             <div className="space-y-3 rounded-xl border border-slate-800 bg-[#080f1b] p-4 text-[9px]">
+
               <div className="flex justify-between">
                 <span className="text-slate-500">Timeframe</span>
                 <b className="text-white">15 minutes</b>
               </div>
+
               <div className="flex justify-between">
                 <span className="text-slate-500">Automatic scan</span>
                 <b className="text-white">30 seconds*</b>
               </div>
+
               <div className="flex justify-between">
                 <span className="text-slate-500">Position reconciliation</span>
                 <b className="text-white">Server managed</b>
               </div>
+
               <div className="flex justify-between">
                 <span className="text-slate-500">Duplicate protection</span>
                 <b className="text-emerald-300">One position maximum</b>
               </div>
+
               <div className="flex justify-between">
                 <span className="text-slate-500">SL / TP</span>
                 <b className="text-emerald-300">Exchange-side protection</b>
               </div>
+
             </div>
 
             <p className="text-[8px] leading-relaxed text-slate-500">
-              *These are intended server-side intervals and must be verified
-              against the running backend. Signal scores are technical
-              heuristics, not proven win probabilities.
+              *Server-side intervals must be verified against the running backend.
+              Signal scores are technical heuristics, not proven win probabilities.
             </p>
+
           </div>
         </div>
       </section>
 
-      {/* ACTIVE POSITION */}
       <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0b1422]">
+
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 p-4">
           <div>
             <p className="text-[10px] font-black text-white">
@@ -664,6 +752,7 @@ export function QuantAIEngine({
               Live exchange position reconciliation
             </p>
           </div>
+
           <span className="text-[9px] text-slate-400">
             {exchangePositions.length} positions · {openOrders.length} orders
           </span>
@@ -671,12 +760,14 @@ export function QuantAIEngine({
 
         {activeTrade ? (
           <div className="space-y-4 p-5">
+
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
                 <div className="flex flex-wrap items-center gap-2">
                   <h3 className="text-xl font-black text-white">
                     {activeTrade.symbol}
                   </h3>
+
                   <span className={`rounded px-2 py-1 text-[9px] font-black ${
                     activeTrade.side === 'BUY'
                       ? 'bg-emerald-500/10 text-emerald-300'
@@ -685,10 +776,12 @@ export function QuantAIEngine({
                     {activeTrade.side === 'BUY' ? 'LONG' : 'SHORT'}
                   </span>
                 </div>
+
                 <p className="mt-2 text-[8px] text-slate-500">
                   Order {activeTrade.entryOrderId ?? '—'} · {date(activeTrade.openedAt)}
                 </p>
               </div>
+
               <div className="text-right">
                 <p className="text-[8px] text-slate-500">UNREALIZED P&L</p>
                 <p className={`mt-1 text-xl font-black ${
@@ -707,17 +800,20 @@ export function QuantAIEngine({
                 value={money(activeTrade.notionalUsd)}
                 hint={`${activeTrade.leverage}x leverage`}
               />
+
               <Stat
                 label="Entry"
                 value={price(activeTrade.entryPrice)}
                 hint={`Quantity ${activeTrade.quantity}`}
               />
+
               <Stat
                 label="Current mark"
                 value={price(activeTrade.markPrice)}
                 hint="Binance position data"
                 color="text-cyan-300"
               />
+
               <Stat
                 label="Protection"
                 value={protectedTrade ? 'READY' : 'VERIFY'}
@@ -727,11 +823,13 @@ export function QuantAIEngine({
             </div>
 
             <div className="grid grid-cols-2 gap-3">
+
               <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 p-4">
                 <div className="flex items-center justify-between">
                   <p className="text-[9px] font-black text-rose-300">STOP LOSS</p>
                   <ArrowDownRight size={16} className="text-rose-300" />
                 </div>
+
                 <p className="mt-3 text-lg font-black text-white">
                   {price(activeTrade.stopPrice)}
                 </p>
@@ -742,27 +840,35 @@ export function QuantAIEngine({
                   <p className="text-[9px] font-black text-emerald-300">TAKE PROFIT</p>
                   <ArrowUpRight size={16} className="text-emerald-300" />
                 </div>
+
                 <p className="mt-3 text-lg font-black text-white">
                   {price(activeTrade.targetPrice)}
                 </p>
               </div>
+
             </div>
 
             {!protectedTrade && (
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-[9px] text-amber-200">
                 Protective orders are not confirmed by the bot snapshot.
-                Verify the Binance Demo open and conditional orders immediately.
+                Verify Binance Demo open and conditional orders immediately.
               </div>
             )}
+
           </div>
         ) : exchangePositions.length > 0 ? (
           <div className="space-y-3 p-5">
+
             <div className="flex items-center gap-2 text-amber-300">
               <AlertTriangle size={16} />
               <b className="text-[9px]">UNTRACKED EXCHANGE POSITION</b>
             </div>
+
             {exchangePositions.map((p, i) => (
-              <div key={`${p.symbol}-${i}`} className="rounded-lg border border-amber-500/20 p-3 text-[9px]">
+              <div
+                key={`${p.symbol}-${i}`}
+                className="rounded-lg border border-amber-500/20 p-3 text-[9px]"
+              >
                 <b className="text-white">{p.symbol}</b>
                 <p className="mt-1 text-slate-400">
                   Amount: {p.positionAmt} · Entry: {price(p.entryPrice)}
@@ -770,10 +876,12 @@ export function QuantAIEngine({
                 </p>
               </div>
             ))}
+
             <p className="text-[8px] text-amber-200">
-              Do not allow a new bot entry until all existing exchange positions
+              Do not allow a new bot entry until existing exchange positions
               have been reconciled.
             </p>
+
           </div>
         ) : (
           <div className="flex flex-col items-center p-10 text-center">
@@ -788,8 +896,8 @@ export function QuantAIEngine({
         )}
       </section>
 
-      {/* TRADE HISTORY */}
       <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0b1422]">
+
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 p-4">
           <div>
             <p className="text-[10px] font-black text-white">
@@ -799,10 +907,12 @@ export function QuantAIEngine({
               {bot.trades.length} records
             </p>
           </div>
+
           <button
+            type="button"
             onClick={() => void exportCsv('history')}
             disabled={!apiConnected || !bot.trades.length}
-            className="flex items-center gap-2 rounded-lg border border-cyan-400/20 px-3 py-2 text-[8px] font-black text-cyan-300 disabled:opacity-30"
+            className="flex cursor-pointer items-center gap-2 rounded-lg border border-cyan-400/20 px-3 py-2 text-[8px] font-black text-cyan-300 disabled:opacity-30"
           >
             <Download size={13} /> EXPORT CSV
           </button>
@@ -818,6 +928,7 @@ export function QuantAIEngine({
                   ))}
                 </tr>
               </thead>
+
               <tbody>
                 {bot.trades.map(trade => (
                   <tr key={trade.id} className="border-t border-slate-800">
@@ -845,8 +956,8 @@ export function QuantAIEngine({
         )}
       </section>
 
-      {/* AUTOMATION LOG */}
       <section className="overflow-hidden rounded-2xl border border-slate-800 bg-[#0b1422]">
+
         <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 p-4">
           <div>
             <p className="text-[10px] font-black text-white">
@@ -856,10 +967,12 @@ export function QuantAIEngine({
               Scanner decisions · execution · reconciliation
             </p>
           </div>
+
           <button
+            type="button"
             onClick={() => void exportCsv('logs')}
             disabled={!apiConnected || !bot.logs.length}
-            className="flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-[8px] font-black text-slate-300 disabled:opacity-30"
+            className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-[8px] font-black text-slate-300 disabled:opacity-30"
           >
             <Download size={13} /> EXPORT LOG
           </button>
@@ -867,8 +980,12 @@ export function QuantAIEngine({
 
         <div className="max-h-80 divide-y divide-slate-800 overflow-y-auto">
           {bot.logs.length ? bot.logs.map((event, i) => (
-            <div key={`${event.at}-${i}`} className="grid grid-cols-[105px_55px_1fr] gap-3 p-3 text-[8px]">
+            <div
+              key={`${event.at}-${i}`}
+              className="grid grid-cols-[105px_55px_1fr] gap-3 p-3 text-[8px]"
+            >
               <span className="text-slate-600">{date(event.at)}</span>
+
               <b className={
                 event.level === 'ERROR' ? 'text-rose-300' :
                 event.level === 'WARN' ? 'text-amber-300' :
@@ -877,6 +994,7 @@ export function QuantAIEngine({
               }>
                 {event.level}
               </b>
+
               <span className="leading-relaxed text-slate-300">
                 {event.message}
               </span>
@@ -889,21 +1007,22 @@ export function QuantAIEngine({
         </div>
       </section>
 
-      {/* SAFETY */}
       <section className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
         <div className="flex items-start gap-2">
           <CheckCircle2 size={16} className="mt-0.5 text-amber-300" />
+
           <div>
             <p className="text-[9px] font-black text-amber-200">
               DEMO EXECUTION SAFETY
             </p>
+
             <p className="mt-2 text-[8px] leading-relaxed text-slate-400">
               This interface is configured for Binance USD-M Futures Demo.
               Pausing the bot should stop new entries, not automatically close
               an existing position. Existing positions must retain verified
               exchange-side protection. One position maximum and duplicate
-              prevention must also be enforced by the backend, not just this UI.
-              Signal scores are not guaranteed win rates.
+              prevention must be enforced by the backend. Signal scores are
+              not guaranteed win rates.
             </p>
           </div>
         </div>
@@ -919,6 +1038,7 @@ export function QuantAIEngine({
           {' · '}Account refresh: {accountLoading ? 'Updating' : '30-second parent refresh'}
         </p>
       </section>
+
     </div>
   );
 }
