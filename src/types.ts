@@ -159,3 +159,287 @@ export interface ClosedSignal {
   executionMode: 'AUTO_PILOT' | 'MANUAL_PUSH';
   leverage: number;
 }
+
+// ======================================================
+// MULTI-AGENT AUTONOMOUS ENGINE TYPES (BINANCE DEMO)
+// ======================================================
+
+export type AgentName =
+  | 'discovery'
+  | 'quant'
+  | 'aiAnalyst'
+  | 'riskManager'
+  | 'execution'
+  | 'monitor';
+
+export type AgentHealthState = 'IDLE' | 'ACTIVE' | 'PAUSED' | 'DEGRADED' | 'ERROR';
+export type EngineRunMode = 'STOPPED' | 'SCAN_ONLY' | 'AUTO_TRADING' | 'PAUSED';
+
+export interface AgentUnitStatus {
+  id: AgentName;
+  label: string;
+  role: string;
+  status: AgentHealthState;
+  lastRunAt: number | null;
+  detail: string;
+}
+
+export interface AgentEngineConfig {
+  environment: 'USD_M_FUTURES_DEMO';
+  minSignalScore: number;
+  riskPerTradePct: number;
+  maxLeverage: number;
+  maxOpenPositions: number;
+  maxOrderNotionalUsd: number;
+  maxDailyLossPct: number;
+  cooldownMinutes: number;
+  requireAiApproval: boolean;
+}
+
+export interface QuantAnalysisResult {
+  symbol: string;
+  direction: 'BUY' | 'SELL' | 'HOLD';
+  heuristicScore: number;
+  signalStrengthScore: number;
+  minScoreRequired: number;
+  price: number;
+  change24h: number;
+  quoteVolume: number;
+  ema9_15m: number;
+  ema21_15m: number;
+  ema50_15m: number;
+  ema9_5m: number;
+  ema21_5m: number;
+  ema50_5m: number;
+  rsi14: number;
+  rsi5m: number;
+  macd: number;
+  macdSignal: number;
+  macdHistogram: number;
+  atr14: number;
+  volatilityPct: number;
+  volumeRatio: number;
+  trendStrength: number;
+  supportLevel: number;
+  resistanceLevel: number;
+  breakout: 'BULLISH_BREAKOUT' | 'BEARISH_BREAKOUT' | 'NONE';
+  mtfAligned: boolean;
+  marketStructure: 'UPTREND_HH_HL' | 'DOWNTREND_LH_LL' | 'RANGING';
+  unusualVolume: boolean;
+  unusualVolatility: boolean;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  reasons: string[];
+  latestClosedCandleTime: number;
+  fetchedAt: number;
+}
+
+export interface GeminiAnalysisResult {
+  symbol: string;
+  available: boolean;
+  degraded: boolean;
+  direction: 'BUY' | 'SELL' | 'HOLD';
+  marketRegime: 'TRENDING' | 'SIDEWAYS' | 'VOLATILE' | 'CONFLICTED';
+  confidence: number;
+  sentiment: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  riskFlags: string[];
+  reasoning: string;
+  error?: string;
+  analyzedAt: number;
+}
+
+export interface RiskCheckItem {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface ApprovedOrderPlan {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  leverage: number;
+  quantity: string;
+  numericQuantity: number;
+  notionalUsd: number;
+  requiredMarginUsd: number;
+  riskAmountUsd: number;
+  riskPerUnit: number;
+  riskPercentOfAvailable: number;
+  stopDistancePct: number;
+  entryPrice: number;
+  stopPrice: string;
+  takeProfitPrice: string;
+  clientOrderId: string;
+}
+
+export interface RiskDecision {
+  symbol: string;
+  approved: boolean;
+  reasons: string[];
+  checks: RiskCheckItem[];
+  orderPlan: ApprovedOrderPlan | null;
+  dailyLossTriggered: boolean;
+  evaluatedAt: number;
+}
+
+export interface OpportunitySnapshot {
+  symbol: string;
+  quant: QuantAnalysisResult;
+  aiAnalysis: GeminiAnalysisResult | null;
+  riskDecision: RiskDecision | null;
+}
+
+export interface AgentTradeRecord {
+  id: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  positionMode: 'ONE_WAY' | 'HEDGE';
+  positionSide: 'BOTH' | 'LONG' | 'SHORT';
+  status: 'OPEN' | 'CLOSED' | 'EMERGENCY_CLOSED';
+  executionStatus: string;
+  requestedQuantity: string;
+  executedQuantity: string;
+  leverage: number;
+  notionalUsd: number;
+  riskUsd: number;
+  entryPrice: number;
+  exitPrice: number | null;
+  markPrice: number;
+  stopPrice: number;
+  takeProfitPrice: number;
+  entryOrderId: number | string | null;
+  entryClientOrderId: string;
+  stopAlgoId: number | string | null;
+  stopClientAlgoId: string;
+  targetAlgoId: number | string | null;
+  targetClientAlgoId: string;
+  emergencyOrderId: number | string | null;
+  stopStatus: 'ARMED' | 'PENDING' | 'FAILED' | 'TRIGGERED' | 'CANCELLED';
+  takeProfitStatus: 'ARMED' | 'PENDING' | 'FAILED' | 'TRIGGERED' | 'CANCELLED';
+  unrealizedPnl: number;
+  realizedPnl: number | null;
+  tradingFees: number;
+  fundingFees: number;
+  commission: number;
+  netPnl: number | null;
+  openedAt: number;
+  closedAt: number | null;
+  closeReason: string | null;
+}
+
+export interface AgentLogEntry {
+  id: string;
+  at: number;
+  agent: string;
+  level: 'INFO' | 'WARN' | 'ERROR' | 'CRITICAL' | 'TRADE';
+  message: string;
+  symbol?: string;
+}
+
+export interface AgentCriticalError {
+  id: string;
+  at: number;
+  symbol?: string;
+  stage: string;
+  message: string;
+  resolved: boolean;
+}
+
+export interface AgentPerformanceSummary {
+  totalTrades: number;
+  openTrades: number;
+  closedTrades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  lossRate: number | null;
+  grossProfit: number;
+  grossLoss: number;
+  profitFactor: number | null;
+  expectancyUsd: number | null;
+  totalRealizedPnl: number;
+  totalTradingFees: number;
+  totalFundingFees: number;
+  totalFees: number;
+  netRealizedPnl: number;
+  todayRealizedPnl: number;
+  dailyStartingEquity: number;
+  dailyDrawdownPct: number;
+  maxDrawdownUsd: number;
+  maxDrawdownPct: number;
+  learningSampleCount: number;
+  equityCurve: Array<{ time: number; cumulativePnl: number; drawdownUsd: number }>;
+  walkForwardReport: {
+    status: 'READY' | 'INSUFFICIENT_SAMPLES';
+    minimumSamplesRequired: number;
+    availableSamples: number;
+    retrainPolicy: string;
+    dynamicRiskMutation: false;
+    folds: Array<{
+      fold: number;
+      trainCount: number;
+      testCount: number;
+      trainWinRate: number;
+      testWinRate: number;
+      testNetPnl: number;
+      testProfitFactor: number | null;
+    }>;
+    summaryNote: string;
+  };
+}
+
+export interface AgentStatusResponse {
+  success: boolean;
+  environment: 'USD_M_FUTURES_DEMO';
+  liveTradingEnabled: false;
+  mode: EngineRunMode;
+  autoTradingEnabled: boolean;
+  demoExplicitlyConfirmed: boolean;
+  credentialsBound: boolean;
+  config: AgentEngineConfig;
+  riskLimits: {
+    RISK_PER_TRADE_PCT: number;
+    MAX_LEVERAGE: number;
+    MAX_OPEN_POSITIONS: number;
+    MAX_ORDER_NOTIONAL_USD: number;
+    MAX_DAILY_LOSS_PCT: number;
+    MIN_SIGNAL_SCORE: number;
+    COOLDOWN_MINUTES: number;
+  };
+  lastScanAt: number | null;
+  lastTradeAt: number | null;
+  scanProgress: {
+    scanning: boolean;
+    totalTargets: number;
+    completedTargets: number;
+    unusualMoversCount: number;
+    stageLabel: string;
+  };
+  agents: AgentUnitStatus[];
+  opportunities: {
+    bestBuy: OpportunitySnapshot | null;
+    bestSell: OpportunitySnapshot | null;
+    scannedTopCount: number;
+    candidates: QuantAnalysisResult[];
+  };
+  aiAnalysis: { symbol: string; result: GeminiAnalysisResult } | null;
+  riskDecision: RiskDecision | null;
+  activeTrade: AgentTradeRecord | null;
+  exchangePositions: Array<{
+    symbol: string;
+    positionSide: string;
+    positionAmt: number;
+    entryPrice: number;
+    markPrice: number;
+    unRealizedProfit: number;
+    leverage: number;
+  }>;
+  exchangeOpenOrdersCount: number;
+  recentTrades: AgentTradeRecord[];
+  criticalErrors: AgentCriticalError[];
+  todayRealizedPnl: number;
+  unrealizedPnl: number;
+  performance: AgentPerformanceSummary;
+  lastError: string | null;
+  updatedAt: number;
+}

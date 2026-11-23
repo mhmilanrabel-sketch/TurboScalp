@@ -1,0 +1,121 @@
+{
+  "version": 2,
+  "config": {
+    "environment": "USD_M_FUTURES_DEMO",
+    "minSignalScore": 65,
+    "riskPerTradePct": 0.25,
+    "maxLeverage": 2,
+    "maxOpenPositions": 1,
+    "maxOrderNotionalUsd": 100,
+    "maxDailyLossPct": 1,
+    "cooldownMinutes": 30,
+    "requireAiApproval": true
+  },
+  "dailyEquity": {
+    "dateUtc": "2026-11-23",
+    "startingEquity": 0,
+    "peakEquity": 0
+  },
+  "lastTradeAt": null,
+  "lastProcessedCandles": {
+    "BTCUSDT": 1795444199999,
+    "ETHUSDT": 1795444199999,
+    "BCHUSDT": 1795444199999,
+    "XRPUSDT": 1795444199999,
+    "BNBUSDT": 1795444199999,
+    "DOGEUSDT": 1795444199999,
+    "FXSUSDT": 1795444199999,
+    "BULLAUSDT": 1795444199999,
+    "PTBUSDT": 1795444199999,
+    "BLESSUSDT": 1795444199999,
+    "PROMUSDT": 1795444199999,
+    "IDOLUSDT": 1795444199999,
+    "RDNTUSDT": 1795444199999,
+    "ARIAUSDT": 1795444199999,
+    "AKEUSDT": 1795444199999,
+    "LISTAUSDT": 1795444199999,
+    "AVAAIUSDT": 1795444199999,
+    "KAVAUSDT": 1795444199999,
+    "VELVETUSDT": 1795444199999
+  },
+  "cooldowns": {},
+  "trades": [],
+  "learningSamples": [],
+  "logs": [
+    {
+      "id": "1795444499178-l7ezkj",
+      "at": 1795444499178,
+      "agent": "SYSTEM",
+      "level": "INFO",
+      "message": "Market Scanner started in SCAN_ONLY mode (no orders placed)."
+    },
+    {
+      "id": "1795444500589-baqrv2",
+      "at": 1795444500589,
+      "agent": "AGENT_3_GEMINI",
+      "level": "ERROR",
+      "message": "AI Market Analyst DEGRADED: {\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}}",
+      "symbol": "DOGEUSDT"
+    },
+    {
+      "id": "1795444500591-zg9ncn",
+      "at": 1795444500591,
+      "agent": "AGENT_4_RISK",
+      "level": "WARN",
+      "message": "DOGEUSDT rejected: Binance Demo API session is disconnected. | AI Analyst DEGRADED: {\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}} | Skipped mathematical sizing because prerequisite checks failed.",
+      "symbol": "DOGEUSDT"
+    },
+    {
+      "id": "1795444505283-67ydnt",
+      "at": 1795444505283,
+      "agent": "SYSTEM",
+      "level": "WARN",
+      "message": "New trades PAUSED by user. Monitoring and protective exits remain active."
+    },
+    {
+      "id": "1795444505302-2s2wiw",
+      "at": 1795444505302,
+      "agent": "SYSTEM",
+      "level": "INFO",
+      "message": "Resumed market scanner (SCAN_ONLY)."
+    },
+    {
+      "id": "1795444505322-n538tg",
+      "at": 1795444505322,
+      "agent": "SYSTEM",
+      "level": "INFO",
+      "message": "Engine stopped by user."
+    },
+    {
+      "id": "1795444528239-785jae",
+      "at": 1795444528239,
+      "agent": "SYSTEM",
+      "level": "INFO",
+      "message": "Market Scanner started in SCAN_ONLY mode (no orders placed)."
+    },
+    {
+      "id": "1795444529846-ks8lha",
+      "at": 1795444529846,
+      "agent": "AGENT_3_GEMINI",
+      "level": "ERROR",
+      "message": "AI Market Analyst DEGRADED: {\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}}",
+      "symbol": "DOGEUSDT"
+    },
+    {
+      "id": "1795444529847-zio0v9",
+      "at": 1795444529847,
+      "agent": "AGENT_4_RISK",
+      "level": "WARN",
+      "message": "DOGEUSDT rejected: Binance Demo API session is disconnected. | AI Analyst DEGRADED: {\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}} | Skipped mathematical sizing because prerequisite checks failed.",
+      "symbol": "DOGEUSDT"
+    },
+    {
+      "id": "1795444534338-e4lee0",
+      "at": 1795444534338,
+      "agent": "SYSTEM",
+      "level": "INFO",
+      "message": "Engine stopped by user."
+    }
+  ],
+  "criticalErrors": []
+}

@@ -3,16 +3,31 @@ import axios from "axios";
 
 // Public market-data endpoints are pinned to Binance USD-M Futures Demo.
 // These endpoints do not authenticate a user or submit any exchange orders.
-const BINANCE_DEMO_API = "https://demo-fapi.binance.com";
+export const BINANCE_DEMO_API = "https://demo-fapi.binance.com";
 
-type Market = {
+export type Market = {
   symbol: string;
   quoteVolume: number;
   priceChangePercent: number;
   lastPrice: number;
+  tickSize?: number;
+  stepSize?: number;
+  minQty?: number;
+  maxQty?: number;
+  minNotional?: number;
 };
 
-type Signal = {
+export type RawKline = {
+  openTime: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  closeTime: number;
+};
+
+export type Signal = {
   symbol: string;
   direction: "BUY" | "SELL" | "NEUTRAL";
   score: number;
@@ -31,16 +46,16 @@ type Signal = {
 let universeCache: { time: number; markets: Market[] } | null = null;
 const CACHE_DURATION = 15_000;
 
-function number(value: unknown): number {
+export function toNumber(value: unknown): number {
   const result = Number(value);
   return Number.isFinite(result) ? result : 0;
 }
 
-function clamp(value: number, min: number, max: number): number {
+export function clampValue(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function ema(values: number[], period: number): number[] {
+export function ema(values: number[], period: number): number[] {
   if (!values.length) return [];
   const multiplier = 2 / (period + 1);
   const output: number[] = [values[0]];
@@ -53,25 +68,55 @@ function ema(values: number[], period: number): number[] {
   return output;
 }
 
-function calculateRSI(closes: number[], period = 14): number {
+export function calculateRSI(closes: number[], period = 14): number {
   if (closes.length <= period) return 50;
   let gains = 0;
   let losses = 0;
 
-  for (let i = closes.length - period; i < closes.length; i++) {
+  for (let i = 1; i <= period; i++) {
     const difference = closes[i] - closes[i - 1];
-    if (difference > 0) gains += difference;
-    else losses += Math.abs(difference);
+    if (difference >= 0) gains += difference;
+    else losses -= difference;
   }
 
-  if (losses === 0) return 100;
-  const averageGain = gains / period;
-  const averageLoss = losses / period;
+  let averageGain = gains / period;
+  let averageLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const difference = closes[i] - closes[i - 1];
+    const g = difference >= 0 ? difference : 0;
+    const l = difference < 0 ? -difference : 0;
+    averageGain = (averageGain * (period - 1) + g) / period;
+    averageLoss = (averageLoss * (period - 1) + l) / period;
+  }
+
+  if (averageLoss === 0) return 100;
   const rs = averageGain / averageLoss;
   return 100 - 100 / (1 + rs);
 }
 
-async function getUniverse(): Promise<Market[]> {
+export function filterClosedCandles(
+  candles: any[],
+  nowMs = Date.now()
+): RawKline[] {
+  if (!Array.isArray(candles)) return [];
+  const closed: RawKline[] = [];
+  for (const c of candles) {
+    if (!Array.isArray(c) || c.length < 7) continue;
+    const openTime = toNumber(c[0]);
+    const open = toNumber(c[1]);
+    const high = toNumber(c[2]);
+    const low = toNumber(c[3]);
+    const close = toNumber(c[4]);
+    const volume = toNumber(c[5]);
+    const closeTime = toNumber(c[6]);
+    if (closeTime > 0 && closeTime <= nowMs && open > 0 && close > 0) {
+      closed.push({ openTime, open, high, low, close, volume, closeTime });
+    }
+  }
+  return closed.sort((a, b) => a.openTime - b.openTime);
+}
+
+export async function getUniverse(): Promise<Market[]> {
   if (universeCache && Date.now() - universeCache.time < CACHE_DURATION) {
     return universeCache.markets;
   }
@@ -83,24 +128,44 @@ async function getUniverse(): Promise<Market[]> {
 
   const exchangeSymbols = exchangeResponse.data?.symbols ?? [];
   const tickers = tickerResponse.data ?? [];
-  const eligibleSymbols = new Set(
-    exchangeSymbols
-      .filter((item: any) =>
-        item.status === "TRADING" &&
-        item.contractType === "PERPETUAL" &&
-        item.quoteAsset === "USDT"
-      )
-      .map((item: any) => item.symbol)
-  );
+  const symbolInfoMap = new Map<string, any>();
+
+  for (const item of exchangeSymbols) {
+    if (
+      item.status === "TRADING" &&
+      item.contractType === "PERPETUAL" &&
+      item.quoteAsset === "USDT"
+    ) {
+      symbolInfoMap.set(item.symbol, item);
+    }
+  }
 
   const markets: Market[] = tickers
-    .filter((item: any) => eligibleSymbols.has(item.symbol))
-    .map((item: any) => ({
-      symbol: item.symbol,
-      quoteVolume: number(item.quoteVolume),
-      priceChangePercent: number(item.priceChangePercent),
-      lastPrice: number(item.lastPrice),
-    }))
+    .filter((item: any) => symbolInfoMap.has(item.symbol))
+    .map((item: any) => {
+      const info = symbolInfoMap.get(item.symbol);
+      const filters = Array.isArray(info?.filters) ? info.filters : [];
+      const priceFilter = filters.find((f: any) => f.filterType === "PRICE_FILTER");
+      const marketLot = filters.find((f: any) => f.filterType === "MARKET_LOT_SIZE");
+      const lotSize = filters.find((f: any) => f.filterType === "LOT_SIZE");
+      const activeLot =
+        marketLot && toNumber(marketLot.stepSize) > 0 ? marketLot : lotSize;
+      const notionalFilter = filters.find(
+        (f: any) => f.filterType === "MIN_NOTIONAL" || f.filterType === "NOTIONAL"
+      );
+
+      return {
+        symbol: item.symbol,
+        quoteVolume: toNumber(item.quoteVolume),
+        priceChangePercent: toNumber(item.priceChangePercent),
+        lastPrice: toNumber(item.lastPrice),
+        tickSize: toNumber(priceFilter?.tickSize) || 0.01,
+        stepSize: toNumber(activeLot?.stepSize) || 0.001,
+        minQty: toNumber(activeLot?.minQty) || 0.001,
+        maxQty: toNumber(activeLot?.maxQty) || 1_000_000,
+        minNotional: toNumber(notionalFilter?.notional ?? notionalFilter?.minNotional) || 5,
+      };
+    })
     .filter((item: Market) => item.lastPrice > 0)
     .sort((a: Market, b: Market) => b.quoteVolume - a.quoteVolume);
 
@@ -108,13 +173,17 @@ async function getUniverse(): Promise<Market[]> {
   return markets;
 }
 
-async function getCandles(symbol: string): Promise<any[]> {
+export async function getCandles(
+  symbol: string,
+  interval: "1m" | "3m" | "5m" | "15m" | "1h" = "15m",
+  limit = 120
+): Promise<any[]> {
   if (!/^[A-Z0-9]{2,30}USDT$/.test(symbol)) {
     throw new Error("Invalid trading symbol");
   }
 
   const response = await axios.get(`${BINANCE_DEMO_API}/fapi/v1/klines`, {
-    params: { symbol, interval: "15m", limit: 120 },
+    params: { symbol, interval, limit },
     timeout: 15_000,
   });
 
@@ -124,12 +193,13 @@ async function getCandles(symbol: string): Promise<any[]> {
   return response.data;
 }
 
-function calculateSignal(symbol: string, candles: any[], market: Market): Signal {
-  const opens = candles.map((c) => number(c[1]));
-  const highs = candles.map((c) => number(c[2]));
-  const lows = candles.map((c) => number(c[3]));
-  const closes = candles.map((c) => number(c[4]));
-  const volumes = candles.map((c) => number(c[5]));
+export function calculateSignal(symbol: string, candles: any[], market: Market): Signal {
+  const closed = filterClosedCandles(candles);
+  const opens = closed.length >= 60 ? closed.map((c) => c.open) : candles.map((c) => toNumber(c[1]));
+  const highs = closed.length >= 60 ? closed.map((c) => c.high) : candles.map((c) => toNumber(c[2]));
+  const lows = closed.length >= 60 ? closed.map((c) => c.low) : candles.map((c) => toNumber(c[3]));
+  const closes = closed.length >= 60 ? closed.map((c) => c.close) : candles.map((c) => toNumber(c[4]));
+  const volumes = closed.length >= 60 ? closed.map((c) => c.volume) : candles.map((c) => toNumber(c[5]));
 
   if (closes.length < 60) throw new Error("Not enough candle data");
 
@@ -225,7 +295,7 @@ function calculateSignal(symbol: string, candles: any[], market: Market): Signal
     reasons.push("Negative 24-hour momentum");
   }
 
-  score = clamp(score, -100, 100);
+  score = clampValue(score, -100, 100);
   let direction: Signal["direction"] = "NEUTRAL";
   if (score >= 45) direction = "BUY";
   if (score <= -45) direction = "SELL";
@@ -239,7 +309,7 @@ function calculateSignal(symbol: string, candles: any[], market: Market): Signal
     : currentPrice - stopDistance * 2;
 
   // Heuristic score, not a statistically validated probability of success.
-  const confidence = Math.round(clamp(50 + Math.abs(score) * 0.45, 50, 95));
+  const confidence = Math.round(clampValue(50 + Math.abs(score) * 0.45, 50, 95));
 
   return {
     symbol,
@@ -258,7 +328,7 @@ function calculateSignal(symbol: string, candles: any[], market: Market): Signal
   };
 }
 
-async function runWithConcurrency<T, R>(
+export async function runWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
   worker: (item: T) => Promise<R>
@@ -279,6 +349,37 @@ async function runWithConcurrency<T, R>(
   });
   await Promise.all(workers);
   return { results: results.filter(Boolean), failed };
+}
+
+export async function scanMarketSignals(options: {
+  limit?: number;
+  offset?: number;
+  minVolume?: number;
+} = {}) {
+  const markets = await getUniverse();
+  const limit = clampValue(options.limit ?? 40, 1, 100);
+  const offset = clampValue(options.offset ?? 0, 0, markets.length);
+  const minVolume = clampValue(options.minVolume ?? 250000, 0, 1_000_000_000_000);
+  const eligibleMarkets = markets.filter((market) => market.quoteVolume >= minVolume);
+  const batch = eligibleMarkets.slice(offset, offset + limit);
+
+  const scanResult = await runWithConcurrency(batch, 5, async (market) => {
+    const candles = await getCandles(market.symbol, "15m", 120);
+    return calculateSignal(market.symbol, candles, market);
+  });
+
+  const signals = scanResult.results.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
+  return {
+    signals,
+    eligibleCount: eligibleMarkets.length,
+    requestedCount: batch.length,
+    scannedCount: signals.length,
+    failedCount: scanResult.failed,
+    offset,
+    limit,
+    nextOffset: offset + batch.length,
+    hasMore: offset + batch.length < eligibleMarkets.length,
+  };
 }
 
 function sendError(res: Response, error: unknown, message: string) {
@@ -303,19 +404,19 @@ export function registerQuantRoutes(app: Express) {
     try {
       const symbol = String(req.params.symbol || "").toUpperCase();
       const rawLimit = Number(req.query.limit ?? 80);
-      const limit = clamp(Number.isFinite(rawLimit) ? rawLimit : 80, 20, 120);
+      const limit = clampValue(Number.isFinite(rawLimit) ? rawLimit : 80, 20, 120);
       if (!/^[A-Z0-9]{2,30}USDT$/.test(symbol)) {
         return res.status(400).json({ success: false, error: "Invalid trading symbol" });
       }
 
       const raw = await getCandles(symbol);
       const selected = raw.slice(-limit).map((c: any[]) => ({
-        time: number(c[0]),
-        open: number(c[1]),
-        high: number(c[2]),
-        low: number(c[3]),
-        close: number(c[4]),
-        volume: number(c[5]),
+        time: toNumber(c[0]),
+        open: toNumber(c[1]),
+        high: toNumber(c[2]),
+        low: toNumber(c[3]),
+        close: toNumber(c[4]),
+        volume: toNumber(c[5]),
       }));
 
       return res.json({
@@ -333,34 +434,19 @@ export function registerQuantRoutes(app: Express) {
   // One scanner endpoint. The frontend uses this as its only signal scanner.
   app.get("/api/quant/scan", async (req, res) => {
     try {
-      const markets = await getUniverse();
       const requestedLimit = Number(req.query.limit ?? 40);
       const requestedOffset = Number(req.query.offset ?? 0);
       const requestedMinVolume = Number(req.query.minVolume ?? 250000);
 
-      const limit = clamp(Number.isFinite(requestedLimit) ? requestedLimit : 40, 1, 100);
-      const offset = clamp(Number.isFinite(requestedOffset) ? requestedOffset : 0, 0, markets.length);
-      const minVolume = clamp(Number.isFinite(requestedMinVolume) ? requestedMinVolume : 250000, 0, 1_000_000_000_000);
-      const eligibleMarkets = markets.filter(market => market.quoteVolume >= minVolume);
-      const batch = eligibleMarkets.slice(offset, offset + limit);
-
-      const scanResult = await runWithConcurrency(batch, 5, async market => {
-        const candles = await getCandles(market.symbol);
-        return calculateSignal(market.symbol, candles, market);
+      const scan = await scanMarketSignals({
+        limit: Number.isFinite(requestedLimit) ? requestedLimit : 40,
+        offset: Number.isFinite(requestedOffset) ? requestedOffset : 0,
+        minVolume: Number.isFinite(requestedMinVolume) ? requestedMinVolume : 250000,
       });
 
-      const signals = scanResult.results.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
       return res.json({
         success: true,
-        signals,
-        eligibleCount: eligibleMarkets.length,
-        requestedCount: batch.length,
-        scannedCount: signals.length,
-        failedCount: scanResult.failed,
-        offset,
-        limit,
-        nextOffset: offset + batch.length,
-        hasMore: offset + batch.length < eligibleMarkets.length,
+        ...scan,
         interval: "15m",
         marketType: "USDT PERPETUAL",
         source: "BINANCE_USDM_FUTURES_DEMO",

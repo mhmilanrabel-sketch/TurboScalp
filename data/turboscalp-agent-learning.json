@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "dailyEquity": {
+    "dateUtc": "2026-11-23",
+    "startingEquity": 0,
+    "peakEquity": 0
+  },
+  "trades": [],
+  "learningSamples": [],
+  "logs": [
+    {
+      "id": "1795443984549-2kezrr",
+      "at": 1795443984549,
+      "agent": "SYSTEM",
+      "level": "INFO",
+      "message": "Multi-Agent Scanner started in SCAN_ONLY mode (no orders placed)."
+    },
+    {
+      "id": "1795443986547-q3yr90",
+      "at": 1795443986547,
+      "agent": "AGENT_3_AI",
+      "level": "ERROR",
+      "message": "{\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}}",
+      "symbol": "XRPUSDT"
+    },
+    {
+      "id": "1795443986548-6x5bsn",
+      "at": 1795443986548,
+      "agent": "AGENT_4_RISK",
+      "level": "WARN",
+      "message": "XRPUSDT rejected: Binance Demo API session is not connected. | AI Market Analyst unavailable: {\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}} | Skipped position sizing because prerequisite market, stop, or balance checks failed.",
+      "symbol": "XRPUSDT"
+    },
+    {
+      "id": "1795443988635-gf1eh8",
+      "at": 1795443988635,
+      "agent": "SYSTEM",
+      "level": "WARN",
+      "message": "Trading paused by user. Existing open positions and protective SL/TP orders remain monitored."
+    },
+    {
+      "id": "1795443988696-4g93y7",
+      "at": 1795443988696,
+      "agent": "SYSTEM",
+      "level": "INFO",
+      "message": "New trades stopped by user."
+    }
+  ]
+}
