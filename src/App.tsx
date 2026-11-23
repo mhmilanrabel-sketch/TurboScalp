@@ -320,15 +320,20 @@ export default function App() {
             </span>
             <span
               className={`rounded-md border px-2.5 py-1.5 text-[10px] font-bold ${
-                apiVerified && account.canTrade && permissionDiagnostics?.orderTestPassed
+                apiVerified &&
+                account.canTrade &&
+                permissionDiagnostics?.tradingConfirmed === true
                   ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
                   : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
               }`}
             >
               {apiVerified
-                ? account.canTrade && permissionDiagnostics?.orderTestPassed
+                ? account.canTrade &&
+                  permissionDiagnostics?.tradingConfirmed === true
                   ? 'DEMO TRADING READY'
-                  : 'API AUTH · TRADING DISABLED'
+                  : permissionDiagnostics?.accountPermissionStatus === 'UNKNOWN'
+                    ? 'PERMISSION UNKNOWN'
+                    : 'API AUTH · TRADING DISABLED'
                 : apiStatus === 'CHECKING'
                   ? 'VERIFYING ACCOUNT'
                   : 'DEMO API NOT VERIFIED'}
@@ -516,6 +521,8 @@ export default function App() {
                 disabled={
                   !apiVerified ||
                   !account.canTrade ||
+                  permissionDiagnostics?.tradingConfirmed !== true ||
+                  permissionDiagnostics?.accountConfigCanTrade !== true ||
                   permissionDiagnostics?.orderTestPassed !== true ||
                   manualBusy
                 }

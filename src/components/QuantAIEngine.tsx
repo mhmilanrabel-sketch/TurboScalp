@@ -306,9 +306,14 @@ export function QuantAIEngine({
       return;
     }
 
-    if (!account.canTrade) {
+    if (
+      !permissionDiagnostics?.tradingConfirmed ||
+      permissionDiagnostics?.accountConfigCanTrade !== true ||
+      !account.canTrade
+    ) {
       setError(
-        'FUTURES ACCOUNT TRADING DISABLED. Binance Demo reports account.canTrade is false.'
+        permissionDiagnostics?.classificationMessage ||
+          'ACCOUNT TRADING DISABLED. Run CHECK FUTURES TRADING PERMISSION first.'
       );
       return;
     }
@@ -316,7 +321,7 @@ export function QuantAIEngine({
     if (!permissionDiagnostics?.orderTestPassed) {
       setError(
         permissionDiagnostics?.classificationMessage ||
-          'FUTURES API ORDER PERMISSION NOT CONFIRMED. Run CHECK FUTURES TRADING PERMISSION first.'
+          'POST /fapi/v1/order/test not confirmed. Run CHECK FUTURES TRADING PERMISSION first.'
       );
       return;
     }
@@ -625,15 +630,17 @@ export function QuantAIEngine({
                       type="button"
                       aria-label="Start or resume Binance Demo autonomous bot"
                       onClick={() => void startBot()}
-                      disabled={loading || accountLoading || !account.canTrade || permissionDiagnostics?.orderTestPassed !== true}
+                      disabled={
+                        loading ||
+                        accountLoading ||
+                        !account.canTrade ||
+                        permissionDiagnostics?.tradingConfirmed !== true
+                      }
                       title={
-                        !account.canTrade
-                          ? 'FUTURES ACCOUNT TRADING DISABLED.'
-                          : permissionDiagnostics?.orderTestPassed !== true
-                            ? 'Run CHECK FUTURES TRADING PERMISSION to confirm POST /fapi/v1/order/test.'
-                            : Number(account.availableBalance) <= 0
-                              ? 'Click to check available Demo margin.'
-                              : 'Start or resume the Binance Demo autonomous bot.'
+                        permissionDiagnostics?.classificationMessage ||
+                        (!account.canTrade
+                          ? 'ACCOUNT TRADING DISABLED.'
+                          : 'Run CHECK FUTURES TRADING PERMISSION to verify account permissions.')
                       }
                       className="relative z-10 flex flex-1 cursor-pointer touch-manipulation items-center justify-center gap-2 rounded-lg bg-cyan-400 p-4 text-[9px] font-black text-slate-950 hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40"
                     >

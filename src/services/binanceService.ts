@@ -12,12 +12,24 @@ export interface BinanceConfig {
   liveTradingEnabled: boolean;
   maxOrderUsd: number;
   maxLeverage: number;
+  canTrade?: boolean;
+  accountCanTrade?: null;
+  accountConfigCanTrade?: boolean | null;
+  permissionStatus?: string;
   diagnostics?: FuturesPermissionDiagnostics | null;
 }
 
 export interface BinanceAccount {
   success: boolean;
   canTrade: boolean;
+  canTradeStatus?: 'ENABLED' | 'DISABLED' | 'UNKNOWN';
+  accountCanTrade?: null;
+  accountConfigCanTrade?: boolean | null;
+  canDeposit?: boolean | null;
+  canWithdraw?: boolean | null;
+  dualSidePosition?: boolean | null;
+  multiAssetsMargin?: boolean | null;
+  feeTier?: number | null;
   totalWalletBalance: string;
   availableBalance: string;
   totalUnrealizedProfit: string;
@@ -149,14 +161,64 @@ export async function testBinanceConnection(): Promise<BinanceTestResult> {
 
   const data = await response.json().catch(() => ({}));
 
-  if (typeof data?.apiAuthenticated === 'boolean') {
+  const hasAuthFlag =
+    typeof data?.apiAuthenticated === 'boolean' ||
+    typeof data?.authenticated === 'boolean';
+
+  if (hasAuthFlag) {
+    const authed =
+      typeof data.authenticated === 'boolean'
+        ? data.authenticated
+        : Boolean(data.apiAuthenticated);
+    const configCanTrade =
+      typeof data.accountConfigCanTrade === 'boolean'
+        ? data.accountConfigCanTrade === true
+        : null;
+
     const classified = classifyFuturesPermission({
-      apiAuthenticated: Boolean(data.apiAuthenticated),
-      canTrade: Boolean(data.canTrade),
+      apiAuthenticated: authed,
+      accountConfigCanTrade: configCanTrade,
+      accountEndpointOk:
+        typeof data.accountEndpointOk === 'boolean'
+          ? data.accountEndpointOk
+          : authed,
+      accountErrorCode:
+        typeof data.accountErrorCode === 'number'
+          ? data.accountErrorCode
+          : null,
+      accountErrorMessage:
+        typeof data.accountErrorMessage === 'string'
+          ? data.accountErrorMessage
+          : null,
+      accountConfigEndpointOk:
+        typeof data.accountConfigEndpointOk === 'boolean'
+          ? data.accountConfigEndpointOk
+          : configCanTrade !== null,
+      accountConfigErrorCode:
+        typeof data.accountConfigErrorCode === 'number'
+          ? data.accountConfigErrorCode
+          : null,
+      accountConfigErrorMessage:
+        typeof data.accountConfigErrorMessage === 'string'
+          ? data.accountConfigErrorMessage
+          : null,
       orderTestPassed: Boolean(data.orderTestPassed),
       orderTestMessage: String(data.orderTestMessage || data.message || ''),
       orderTestCode:
         typeof data.orderTestCode === 'number' ? data.orderTestCode : null,
+      canDeposit:
+        typeof data.canDeposit === 'boolean' ? data.canDeposit : null,
+      canWithdraw:
+        typeof data.canWithdraw === 'boolean' ? data.canWithdraw : null,
+      dualSidePosition:
+        typeof data.dualSidePosition === 'boolean'
+          ? data.dualSidePosition
+          : null,
+      multiAssetsMargin:
+        typeof data.multiAssetsMargin === 'boolean'
+          ? data.multiAssetsMargin
+          : null,
+      feeTier: typeof data.feeTier === 'number' ? data.feeTier : null,
       walletBalance: Number(data.walletBalance ?? 0),
       availableBalance: Number(data.availableBalance ?? 0),
       lastVerifiedAt:
@@ -190,7 +252,11 @@ export async function testBinanceConnection(): Promise<BinanceTestResult> {
 
     const fallback = classifyFuturesPermission({
       apiAuthenticated: !isUnauth,
-      canTrade: false,
+      accountConfigCanTrade: null,
+      accountEndpointOk: false,
+      accountErrorCode: errCode,
+      accountErrorMessage: errMsg,
+      accountConfigEndpointOk: false,
       orderTestPassed: false,
       orderTestMessage: errMsg,
       orderTestCode: errCode,
@@ -204,9 +270,16 @@ export async function testBinanceConnection(): Promise<BinanceTestResult> {
     };
   }
 
+  const configCanTrade =
+    typeof data.accountConfigCanTrade === 'boolean'
+      ? data.accountConfigCanTrade === true
+      : typeof data.canTrade === 'boolean'
+        ? data.canTrade === true
+        : null;
+
   const classified = classifyFuturesPermission({
     apiAuthenticated: true,
-    canTrade: Boolean(data.canTrade),
+    accountConfigCanTrade: configCanTrade,
     orderTestPassed: Boolean(data.orderTestPassed),
     orderTestMessage: String(data.orderTestMessage || data.message || ''),
     orderTestCode:

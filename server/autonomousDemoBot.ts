@@ -764,11 +764,9 @@ export function registerAutonomousDemoBotRoutes(
             error: diag.orderTestMessage || 'Demo credentials rejected by Binance',
           });
         }
-        if (!diag.canTrade || !diag.orderTestPassed) {
+        if (!diag.tradingConfirmed) {
           state.status = 'PAUSED';
-          const reason = !diag.canTrade
-            ? 'FUTURES ACCOUNT TRADING DISABLED.'
-            : `${diag.classificationMessage} (${diag.orderTestMessage})`;
+          const reason = diag.classificationMessage || 'ACCOUNT TRADING DISABLED.';
           state.message = reason;
           addLog('WARN', `Start blocked: ${reason}`);
           return res.status(403).json({

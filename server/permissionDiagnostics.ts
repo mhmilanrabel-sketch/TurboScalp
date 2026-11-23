@@ -1,34 +1,68 @@
 // server/permissionDiagnostics.ts
-// Non-executing Binance USD-M Futures DEMO permission diagnostics.
-// Strictly uses https://demo-fapi.binance.com via injected binanceRequest.
-// Never places live or real orders during validation.
+// Binance USD-M Futures DEMO permission diagnostics.
+// Strictly uses https://demo-fapi.binance.com.
+// Never reads account configuration fields from GET /fapi/v3/account
+// (removed by Binance on July 24, 2024); uses GET /fapi/v1/accountConfig
+// as the authoritative source for canTrade === true and account configuration.
+// Never places live or Demo orders during diagnostics.
 
-export type ApiAuthStatus = 'AUTHENTICATED' | 'DISCONNECTED';
-export type AccountCanTradeStatus = 'ENABLED' | 'DISABLED';
+export const BINANCE_DEMO_REST_ENDPOINT = 'https://demo-fapi.binance.com';
+
+export type ApiAuthStatus = 'VERIFIED' | 'DISCONNECTED';
+export type AccountTradingPermissionStatus =
+  | 'ENABLED'
+  | 'DISABLED'
+  | 'UNKNOWN'
+  | 'ERROR';
 export type OrderTestStatus = 'PASSED' | 'FAILED';
+
+export type PermissionStatusCode =
+  | 'ACCOUNT_PERMISSION_AND_TEST_VALIDATION_PASSED'
+  | 'ACCOUNT_TRADING_DISABLED'
+  | 'ACCOUNT_PERMISSION_UNKNOWN'
+  | 'ORDER_TEST_VALIDATION_FAILED'
+  | 'ENDPOINT_ERROR'
+  | 'DISCONNECTED';
 
 export type PermissionClassificationCode =
   | 'DEMO_ORDER_VALIDATION_PASSED'
-  | 'FUTURES_ACCOUNT_DISABLED'
-  | 'FUTURES_API_PERMISSION_ERROR'
-  | 'ORDER_TEST_ERROR'
+  | 'ACCOUNT_TRADING_DISABLED'
+  | 'ACCOUNT_PERMISSION_UNKNOWN'
+  | 'ENDPOINT_ERROR'
   | 'DISCONNECTED';
 
 export interface FuturesPermissionDiagnostics {
   environment: 'USD_M_FUTURES_DEMO';
+  restEndpoint: string;
+  authenticated: boolean;
   apiAuthenticated: boolean;
   apiAuthStatus: ApiAuthStatus;
+  walletBalance: number;
+  availableBalance: number;
+  accountCanTrade: null;
+  accountConfigCanTrade: boolean | null;
   canTrade: boolean;
-  canTradeStatus: AccountCanTradeStatus;
+  canTradeStatus: 'ENABLED' | 'DISABLED' | 'UNKNOWN';
+  accountPermissionStatus: AccountTradingPermissionStatus;
+  canDeposit: boolean | null;
+  canWithdraw: boolean | null;
+  dualSidePosition: boolean | null;
+  multiAssetsMargin: boolean | null;
+  feeTier: number | null;
   orderTestPassed: boolean;
   orderTestStatus: OrderTestStatus;
   orderTestMessage: string;
   orderTestCode: number | null;
+  accountEndpointOk: boolean;
+  accountErrorCode: number | null;
+  accountErrorMessage: string | null;
+  accountConfigEndpointOk: boolean;
+  accountConfigErrorCode: number | null;
+  accountConfigErrorMessage: string | null;
+  permissionStatus: PermissionStatusCode;
   classificationCode: PermissionClassificationCode;
   classificationMessage: string;
   tradingConfirmed: boolean;
-  walletBalance: number;
-  availableBalance: number;
   lastVerifiedAt: number;
 }
 
@@ -59,12 +93,49 @@ export function isBinancePermissionError(
   );
 }
 
+function formatEndpointFailure(
+  endpoint: string,
+  code: number | null,
+  message: string
+): string {
+  const cleanMsg = message.trim() || 'Request failed.';
+  return code !== null
+    ? `${endpoint} failed [Code ${code}]: ${cleanMsg}`
+    : `${endpoint} failed: ${cleanMsg}`;
+}
+
+function extractBinanceError(
+  err: any,
+  fallbackMessage: string
+): { code: number | null; message: string } {
+  const code =
+    typeof err?.code === 'number' && Number.isFinite(err.code)
+      ? err.code
+      : typeof err?.status === 'number' && Number.isFinite(err.status)
+        ? err.status
+        : null;
+  const message =
+    String(err?.message || fallbackMessage).trim() || fallbackMessage;
+  return { code, message };
+}
+
 export function classifyFuturesPermission(input: {
   apiAuthenticated: boolean;
-  canTrade: boolean;
+  accountConfigCanTrade?: boolean | null;
+  accountEndpointOk?: boolean;
+  accountErrorCode?: number | null;
+  accountErrorMessage?: string | null;
+  accountConfigEndpointOk?: boolean;
+  accountConfigErrorCode?: number | null;
+  accountConfigErrorMessage?: string | null;
   orderTestPassed: boolean;
   orderTestMessage: string;
   orderTestCode: number | null;
+  canDeposit?: boolean | null;
+  canWithdraw?: boolean | null;
+  dualSidePosition?: boolean | null;
+  multiAssetsMargin?: boolean | null;
+  feeTier?: number | null;
   walletBalance?: number;
   availableBalance?: number;
   lastVerifiedAt?: number;
@@ -76,118 +147,374 @@ export function classifyFuturesPermission(input: {
   const availableBalance = Number.isFinite(Number(input.availableBalance))
     ? Number(input.availableBalance)
     : 0;
-  const rawMessage = String(input.orderTestMessage || '').trim();
-  const code =
-    typeof input.orderTestCode === 'number' && Number.isFinite(input.orderTestCode)
+
+  // Authoritative trading permission comes strictly from GET /fapi/v1/accountConfig.
+  // GET /fapi/v3/account does not return account configuration fields (always null).
+  const accountConfigCanTrade =
+    typeof input.accountConfigCanTrade === 'boolean'
+      ? input.accountConfigCanTrade === true
+      : null;
+
+  const accountEndpointOk =
+    input.accountEndpointOk !== undefined
+      ? Boolean(input.accountEndpointOk)
+      : input.apiAuthenticated;
+  const accountConfigEndpointOk =
+    input.accountConfigEndpointOk !== undefined
+      ? Boolean(input.accountConfigEndpointOk)
+      : accountConfigCanTrade !== null;
+
+  const accountErrorCode =
+    typeof input.accountErrorCode === 'number' &&
+    Number.isFinite(input.accountErrorCode)
+      ? input.accountErrorCode
+      : null;
+  const accountErrorMessage = input.accountErrorMessage
+    ? String(input.accountErrorMessage).trim()
+    : null;
+  const accountConfigErrorCode =
+    typeof input.accountConfigErrorCode === 'number' &&
+    Number.isFinite(input.accountConfigErrorCode)
+      ? input.accountConfigErrorCode
+      : null;
+  const accountConfigErrorMessage = input.accountConfigErrorMessage
+    ? String(input.accountConfigErrorMessage).trim()
+    : null;
+
+  const rawOrderMsg = String(input.orderTestMessage || '').trim();
+  const orderTestCode =
+    typeof input.orderTestCode === 'number' &&
+    Number.isFinite(input.orderTestCode)
       ? input.orderTestCode
+      : null;
+  const orderTestPassed = Boolean(input.orderTestPassed);
+
+  const canDeposit =
+    typeof input.canDeposit === 'boolean' ? input.canDeposit : null;
+  const canWithdraw =
+    typeof input.canWithdraw === 'boolean' ? input.canWithdraw : null;
+  const dualSidePosition =
+    typeof input.dualSidePosition === 'boolean' ? input.dualSidePosition : null;
+  const multiAssetsMargin =
+    typeof input.multiAssetsMargin === 'boolean'
+      ? input.multiAssetsMargin
+      : null;
+  const feeTier =
+    typeof input.feeTier === 'number' && Number.isFinite(input.feeTier)
+      ? input.feeTier
       : null;
 
   if (!input.apiAuthenticated) {
+    const firstFailure = accountErrorMessage
+      ? formatEndpointFailure(
+          'GET /fapi/v3/account',
+          accountErrorCode,
+          accountErrorMessage
+        )
+      : accountConfigErrorMessage
+        ? formatEndpointFailure(
+            'GET /fapi/v1/accountConfig',
+            accountConfigErrorCode,
+            accountConfigErrorMessage
+          )
+        : rawOrderMsg || 'Binance Demo API session is disconnected.';
+
     return {
       environment: 'USD_M_FUTURES_DEMO',
+      restEndpoint: BINANCE_DEMO_REST_ENDPOINT,
+      authenticated: false,
       apiAuthenticated: false,
       apiAuthStatus: 'DISCONNECTED',
-      canTrade: false,
-      canTradeStatus: 'DISABLED',
-      orderTestPassed: false,
-      orderTestStatus: 'FAILED',
-      orderTestMessage:
-        rawMessage || 'Binance Demo API session is disconnected.',
-      orderTestCode: code,
-      classificationCode: 'DISCONNECTED',
-      classificationMessage:
-        rawMessage || 'Binance Demo API session is disconnected.',
-      tradingConfirmed: false,
       walletBalance: 0,
       availableBalance: 0,
+      accountCanTrade: null,
+      accountConfigCanTrade: null,
+      canTrade: false,
+      canTradeStatus: 'UNKNOWN',
+      accountPermissionStatus: 'ERROR',
+      canDeposit,
+      canWithdraw,
+      dualSidePosition,
+      multiAssetsMargin,
+      feeTier,
+      orderTestPassed: false,
+      orderTestStatus: 'FAILED',
+      orderTestMessage: rawOrderMsg || firstFailure,
+      orderTestCode,
+      accountEndpointOk: false,
+      accountErrorCode,
+      accountErrorMessage,
+      accountConfigEndpointOk: false,
+      accountConfigErrorCode,
+      accountConfigErrorMessage,
+      permissionStatus: 'DISCONNECTED',
+      classificationCode: 'DISCONNECTED',
+      classificationMessage: firstFailure,
+      tradingConfirmed: false,
       lastVerifiedAt: verifiedAt,
     };
   }
 
-  const canTrade = Boolean(input.canTrade);
-  const orderTestPassed = Boolean(input.orderTestPassed);
-
-  if (!canTrade) {
+  // GET /fapi/v1/accountConfig request itself failed -> report exact Binance error
+  if (!accountConfigEndpointOk) {
+    const msg = formatEndpointFailure(
+      'GET /fapi/v1/accountConfig',
+      accountConfigErrorCode,
+      accountConfigErrorMessage || 'Signed accountConfig request failed.'
+    );
     return {
       environment: 'USD_M_FUTURES_DEMO',
+      restEndpoint: BINANCE_DEMO_REST_ENDPOINT,
+      authenticated: true,
       apiAuthenticated: true,
-      apiAuthStatus: 'AUTHENTICATED',
+      apiAuthStatus: 'VERIFIED',
+      walletBalance,
+      availableBalance,
+      accountCanTrade: null,
+      accountConfigCanTrade: null,
       canTrade: false,
-      canTradeStatus: 'DISABLED',
+      canTradeStatus: 'UNKNOWN',
+      accountPermissionStatus: 'ERROR',
+      canDeposit,
+      canWithdraw,
+      dualSidePosition,
+      multiAssetsMargin,
+      feeTier,
       orderTestPassed,
       orderTestStatus: orderTestPassed ? 'PASSED' : 'FAILED',
       orderTestMessage:
-        rawMessage || 'Binance account reports canTrade=false.',
-      orderTestCode: code,
-      classificationCode: 'FUTURES_ACCOUNT_DISABLED',
-      classificationMessage: 'FUTURES ACCOUNT TRADING DISABLED.',
+        rawOrderMsg ||
+        (orderTestPassed
+          ? 'POST /fapi/v1/order/test passed without placing an order.'
+          : 'POST /fapi/v1/order/test failed.'),
+      orderTestCode,
+      accountEndpointOk,
+      accountErrorCode,
+      accountErrorMessage,
+      accountConfigEndpointOk: false,
+      accountConfigErrorCode,
+      accountConfigErrorMessage:
+        accountConfigErrorMessage || 'GET /fapi/v1/accountConfig failed.',
+      permissionStatus: 'ENDPOINT_ERROR',
+      classificationCode: 'ENDPOINT_ERROR',
+      classificationMessage: msg,
       tradingConfirmed: false,
-      walletBalance,
-      availableBalance,
       lastVerifiedAt: verifiedAt,
     };
   }
 
+  // GET /fapi/v1/accountConfig succeeded, check strict boolean field
+  if (accountConfigCanTrade === null) {
+    return {
+      environment: 'USD_M_FUTURES_DEMO',
+      restEndpoint: BINANCE_DEMO_REST_ENDPOINT,
+      authenticated: true,
+      apiAuthenticated: true,
+      apiAuthStatus: 'VERIFIED',
+      walletBalance,
+      availableBalance,
+      accountCanTrade: null,
+      accountConfigCanTrade: null,
+      canTrade: false,
+      canTradeStatus: 'UNKNOWN',
+      accountPermissionStatus: 'UNKNOWN',
+      canDeposit,
+      canWithdraw,
+      dualSidePosition,
+      multiAssetsMargin,
+      feeTier,
+      orderTestPassed,
+      orderTestStatus: orderTestPassed ? 'PASSED' : 'FAILED',
+      orderTestMessage:
+        rawOrderMsg ||
+        (orderTestPassed
+          ? 'POST /fapi/v1/order/test passed without placing an order.'
+          : 'POST /fapi/v1/order/test failed.'),
+      orderTestCode,
+      accountEndpointOk,
+      accountErrorCode,
+      accountErrorMessage,
+      accountConfigEndpointOk: true,
+      accountConfigErrorCode: null,
+      accountConfigErrorMessage: null,
+      permissionStatus: 'ACCOUNT_PERMISSION_UNKNOWN',
+      classificationCode: 'ACCOUNT_PERMISSION_UNKNOWN',
+      classificationMessage:
+        'FUTURES ACCOUNT TRADING PERMISSION: UNKNOWN (canTrade missing from /fapi/v1/accountConfig).',
+      tradingConfirmed: false,
+      lastVerifiedAt: verifiedAt,
+    };
+  }
+
+  // GET /fapi/v3/account failed while /fapi/v1/accountConfig succeeded
+  if (!accountEndpointOk) {
+    const msg = formatEndpointFailure(
+      'GET /fapi/v3/account',
+      accountErrorCode,
+      accountErrorMessage || 'Signed account balance request failed.'
+    );
+    return {
+      environment: 'USD_M_FUTURES_DEMO',
+      restEndpoint: BINANCE_DEMO_REST_ENDPOINT,
+      authenticated: true,
+      apiAuthenticated: true,
+      apiAuthStatus: 'VERIFIED',
+      walletBalance,
+      availableBalance,
+      accountCanTrade: null,
+      accountConfigCanTrade,
+      canTrade: accountConfigCanTrade,
+      canTradeStatus: accountConfigCanTrade ? 'ENABLED' : 'DISABLED',
+      accountPermissionStatus: accountConfigCanTrade ? 'ENABLED' : 'DISABLED',
+      canDeposit,
+      canWithdraw,
+      dualSidePosition,
+      multiAssetsMargin,
+      feeTier,
+      orderTestPassed,
+      orderTestStatus: orderTestPassed ? 'PASSED' : 'FAILED',
+      orderTestMessage:
+        rawOrderMsg ||
+        (orderTestPassed
+          ? 'POST /fapi/v1/order/test passed without placing an order.'
+          : 'POST /fapi/v1/order/test failed.'),
+      orderTestCode,
+      accountEndpointOk: false,
+      accountErrorCode,
+      accountErrorMessage:
+        accountErrorMessage || 'GET /fapi/v3/account failed.',
+      accountConfigEndpointOk: true,
+      accountConfigErrorCode: null,
+      accountConfigErrorMessage: null,
+      permissionStatus: 'ENDPOINT_ERROR',
+      classificationCode: 'ENDPOINT_ERROR',
+      classificationMessage: msg,
+      tradingConfirmed: false,
+      lastVerifiedAt: verifiedAt,
+    };
+  }
+
+  // Authoritative accountConfig.canTrade === false
+  if (accountConfigCanTrade === false) {
+    return {
+      environment: 'USD_M_FUTURES_DEMO',
+      restEndpoint: BINANCE_DEMO_REST_ENDPOINT,
+      authenticated: true,
+      apiAuthenticated: true,
+      apiAuthStatus: 'VERIFIED',
+      walletBalance,
+      availableBalance,
+      accountCanTrade: null,
+      accountConfigCanTrade: false,
+      canTrade: false,
+      canTradeStatus: 'DISABLED',
+      accountPermissionStatus: 'DISABLED',
+      canDeposit,
+      canWithdraw,
+      dualSidePosition,
+      multiAssetsMargin,
+      feeTier,
+      orderTestPassed,
+      orderTestStatus: orderTestPassed ? 'PASSED' : 'FAILED',
+      orderTestMessage:
+        rawOrderMsg ||
+        (orderTestPassed
+          ? 'POST /fapi/v1/order/test passed (parameter check only); /fapi/v1/accountConfig reports canTrade=false.'
+          : 'POST /fapi/v1/order/test failed.'),
+      orderTestCode,
+      accountEndpointOk: true,
+      accountErrorCode: null,
+      accountErrorMessage: null,
+      accountConfigEndpointOk: true,
+      accountConfigErrorCode: null,
+      accountConfigErrorMessage: null,
+      permissionStatus: 'ACCOUNT_TRADING_DISABLED',
+      classificationCode: 'ACCOUNT_TRADING_DISABLED',
+      classificationMessage: 'ACCOUNT TRADING DISABLED.',
+      tradingConfirmed: false,
+      lastVerifiedAt: verifiedAt,
+    };
+  }
+
+  // Authoritative accountConfig.canTrade === true AND order/test PASSED
   if (orderTestPassed) {
     return {
       environment: 'USD_M_FUTURES_DEMO',
+      restEndpoint: BINANCE_DEMO_REST_ENDPOINT,
+      authenticated: true,
       apiAuthenticated: true,
-      apiAuthStatus: 'AUTHENTICATED',
+      apiAuthStatus: 'VERIFIED',
+      walletBalance,
+      availableBalance,
+      accountCanTrade: null,
+      accountConfigCanTrade: true,
       canTrade: true,
       canTradeStatus: 'ENABLED',
+      accountPermissionStatus: 'ENABLED',
+      canDeposit,
+      canWithdraw,
+      dualSidePosition,
+      multiAssetsMargin,
+      feeTier,
       orderTestPassed: true,
       orderTestStatus: 'PASSED',
       orderTestMessage:
-        rawMessage ||
+        rawOrderMsg ||
         'Binance Demo POST /fapi/v1/order/test accepted non-executing order validation.',
       orderTestCode: null,
+      accountEndpointOk: true,
+      accountErrorCode: null,
+      accountErrorMessage: null,
+      accountConfigEndpointOk: true,
+      accountConfigErrorCode: null,
+      accountConfigErrorMessage: null,
+      permissionStatus: 'ACCOUNT_PERMISSION_AND_TEST_VALIDATION_PASSED',
       classificationCode: 'DEMO_ORDER_VALIDATION_PASSED',
-      classificationMessage: 'DEMO ORDER VALIDATION PASSED.',
+      classificationMessage:
+        'ACCOUNT PERMISSION AND DEMO ORDER VALIDATION PASSED.',
       tradingConfirmed: true,
-      walletBalance,
-      availableBalance,
       lastVerifiedAt: verifiedAt,
     };
   }
 
-  if (isBinancePermissionError(code, rawMessage)) {
-    return {
-      environment: 'USD_M_FUTURES_DEMO',
-      apiAuthenticated: true,
-      apiAuthStatus: 'AUTHENTICATED',
-      canTrade: true,
-      canTradeStatus: 'ENABLED',
-      orderTestPassed: false,
-      orderTestStatus: 'FAILED',
-      orderTestMessage:
-        rawMessage || 'Binance rejected test order due to API permission limits.',
-      orderTestCode: code,
-      classificationCode: 'FUTURES_API_PERMISSION_ERROR',
-      classificationMessage: 'FUTURES API ORDER PERMISSION NOT CONFIRMED.',
-      tradingConfirmed: false,
-      walletBalance,
-      availableBalance,
-      lastVerifiedAt: verifiedAt,
-    };
-  }
-
+  // Authoritative accountConfig.canTrade === true, but order/test FAILED
+  const orderFailureMsg = formatEndpointFailure(
+    'POST /fapi/v1/order/test',
+    orderTestCode,
+    rawOrderMsg || 'Order validation request failed.'
+  );
   return {
     environment: 'USD_M_FUTURES_DEMO',
+    restEndpoint: BINANCE_DEMO_REST_ENDPOINT,
+    authenticated: true,
     apiAuthenticated: true,
-    apiAuthStatus: 'AUTHENTICATED',
-    canTrade: true,
-    canTradeStatus: 'ENABLED',
-    orderTestPassed: false,
-    orderTestStatus: 'FAILED',
-    orderTestMessage:
-      rawMessage || 'Binance Demo POST /fapi/v1/order/test failed.',
-    orderTestCode: code,
-    classificationCode: 'ORDER_TEST_ERROR',
-    classificationMessage:
-      rawMessage || 'Binance Demo POST /fapi/v1/order/test failed.',
-    tradingConfirmed: false,
+    apiAuthStatus: 'VERIFIED',
     walletBalance,
     availableBalance,
+    accountCanTrade: null,
+    accountConfigCanTrade: true,
+    canTrade: true,
+    canTradeStatus: 'ENABLED',
+    accountPermissionStatus: 'ENABLED',
+    canDeposit,
+    canWithdraw,
+    dualSidePosition,
+    multiAssetsMargin,
+    feeTier,
+    orderTestPassed: false,
+    orderTestStatus: 'FAILED',
+    orderTestMessage: rawOrderMsg || 'Order validation request failed.',
+    orderTestCode,
+    accountEndpointOk: true,
+    accountErrorCode: null,
+    accountErrorMessage: null,
+    accountConfigEndpointOk: true,
+    accountConfigErrorCode: null,
+    accountConfigErrorMessage: null,
+    permissionStatus: 'ORDER_TEST_VALIDATION_FAILED',
+    classificationCode: 'ENDPOINT_ERROR',
+    classificationMessage: orderFailureMsg,
+    tradingConfirmed: false,
     lastVerifiedAt: verifiedAt,
   };
 }
@@ -202,7 +529,8 @@ function ceilQtyToStep(rawQty: number, stepSizeStr: string): string {
 
 async function buildNonExecutingTestOrderParams(
   binanceRequest: PermissionBinanceRequestFn,
-  credentials: { apiKey: string; apiSecret: string }
+  credentials: { apiKey: string; apiSecret: string },
+  knownDualSidePosition?: boolean | null
 ): Promise<Record<string, string>> {
   const symbol = 'BTCUSDT';
   let quantity = '0.002';
@@ -227,9 +555,15 @@ async function buildNonExecutingTestOrderParams(
       const qtyFilter =
         marketLot && Number(marketLot.stepSize) > 0 ? marketLot : lot;
       const minNotional = Number(minNotionalFilter?.notional ?? 50);
-      const targetUsd = Math.max(60, Number.isFinite(minNotional) ? minNotional * 1.2 : 60);
+      const targetUsd = Math.max(
+        60,
+        Number.isFinite(minNotional) ? minNotional * 1.2 : 60
+      );
       if (qtyFilter?.stepSize) {
-        const computed = ceilQtyToStep(targetUsd / price, String(qtyFilter.stepSize));
+        const computed = ceilQtyToStep(
+          targetUsd / price,
+          String(qtyFilter.stepSize)
+        );
         const minQty = Number(qtyFilter.minQty ?? 0);
         quantity =
           Number(computed) >= minQty
@@ -242,19 +576,25 @@ async function buildNonExecutingTestOrderParams(
   }
 
   let positionSideParam: Record<string, string> = {};
-  try {
-    const dual = await binanceRequest<any>(
-      'GET',
-      '/fapi/v1/positionSide/dual',
-      {},
-      true,
-      credentials
-    );
-    if (dual?.dualSidePosition === true) {
+  if (typeof knownDualSidePosition === 'boolean') {
+    if (knownDualSidePosition) {
       positionSideParam = { positionSide: 'LONG' };
     }
-  } catch {
-    // Default One-Way mode if dual position mode query fails.
+  } else {
+    try {
+      const dual = await binanceRequest<any>(
+        'GET',
+        '/fapi/v1/positionSide/dual',
+        {},
+        true,
+        credentials
+      );
+      if (dual?.dualSidePosition === true) {
+        positionSideParam = { positionSide: 'LONG' };
+      }
+    } catch {
+      // Default One-Way mode if dual position mode query fails.
+    }
   }
 
   return {
@@ -271,86 +611,160 @@ export async function runNonExecutingPermissionDiagnostic(
   credentials: { apiKey: string; apiSecret: string },
   preFetchedAccount?: any
 ): Promise<FuturesPermissionDiagnostics> {
-  const now = Date.now();
-  let account = preFetchedAccount;
+  // Query GET /fapi/v3/account (for balances/assets) and GET /fapi/v1/accountConfig (authoritative permissions)
+  const accountPromise = preFetchedAccount
+    ? Promise.resolve(preFetchedAccount)
+    : binanceRequest<any>('GET', '/fapi/v3/account', {}, true, credentials);
 
-  if (!account) {
-    try {
-      account = await binanceRequest<any>(
-        'GET',
-        '/fapi/v3/account',
-        {},
-        true,
-        credentials
-      );
-    } catch (err: any) {
-      const code =
-        typeof err?.code === 'number'
-          ? err.code
-          : typeof err?.status === 'number'
-            ? err.status
-            : null;
-      return classifyFuturesPermission({
-        apiAuthenticated: false,
-        canTrade: false,
-        orderTestPassed: false,
-        orderTestMessage:
-          err?.message || 'Signed Binance Demo account authentication failed.',
-        orderTestCode: code,
-        lastVerifiedAt: now,
-      });
-    }
+  const accountConfigPromise = binanceRequest<any>(
+    'GET',
+    '/fapi/v1/accountConfig',
+    {},
+    true,
+    credentials
+  );
+
+  const [accountSettled, configSettled] = await Promise.allSettled([
+    accountPromise,
+    accountConfigPromise,
+  ]);
+
+  let accountEndpointOk = false;
+  let accountErrorCode: number | null = null;
+  let accountErrorMessage: string | null = null;
+  let walletBalance = 0;
+  let availableBalance = 0;
+
+  if (accountSettled.status === 'fulfilled' && accountSettled.value) {
+    const account = accountSettled.value;
+    accountEndpointOk = true;
+    const usdt = Array.isArray(account?.assets)
+      ? account.assets.find((item: any) => item.asset === 'USDT')
+      : undefined;
+    walletBalance = Number(
+      usdt?.walletBalance ?? account?.totalWalletBalance ?? 0
+    );
+    availableBalance = Number(
+      usdt?.availableBalance ?? account?.availableBalance ?? 0
+    );
+  } else {
+    const err = extractBinanceError(
+      accountSettled.status === 'rejected' ? accountSettled.reason : null,
+      'Signed GET /fapi/v3/account request failed.'
+    );
+    accountEndpointOk = false;
+    accountErrorCode = err.code;
+    accountErrorMessage = err.message;
   }
 
-  const usdt = Array.isArray(account?.assets)
-    ? account.assets.find((item: any) => item.asset === 'USDT')
-    : undefined;
-  const walletBalance = Number(
-    usdt?.walletBalance ?? account?.totalWalletBalance ?? 0
-  );
-  const availableBalance = Number(
-    usdt?.availableBalance ?? account?.availableBalance ?? 0
-  );
-  const canTrade = Boolean(account?.canTrade);
+  let accountConfigEndpointOk = false;
+  let accountConfigCanTrade: boolean | null = null;
+  let accountConfigErrorCode: number | null = null;
+  let accountConfigErrorMessage: string | null = null;
+  let canDeposit: boolean | null = null;
+  let canWithdraw: boolean | null = null;
+  let dualSidePosition: boolean | null = null;
+  let multiAssetsMargin: boolean | null = null;
+  let feeTier: number | null = null;
 
+  if (configSettled.status === 'fulfilled' && configSettled.value) {
+    const cfg = configSettled.value;
+    accountConfigEndpointOk = true;
+    // Strict boolean validation from authoritative /fapi/v1/accountConfig
+    accountConfigCanTrade =
+      typeof cfg?.canTrade === 'boolean' ? cfg.canTrade === true : null;
+    if (typeof cfg?.canDeposit === 'boolean') canDeposit = cfg.canDeposit;
+    if (typeof cfg?.canWithdraw === 'boolean') canWithdraw = cfg.canWithdraw;
+    if (typeof cfg?.dualSidePosition === 'boolean') {
+      dualSidePosition = cfg.dualSidePosition;
+    }
+    if (typeof cfg?.multiAssetsMargin === 'boolean') {
+      multiAssetsMargin = cfg.multiAssetsMargin;
+    }
+    if (typeof cfg?.feeTier === 'number' && Number.isFinite(cfg.feeTier)) {
+      feeTier = cfg.feeTier;
+    }
+  } else {
+    const err = extractBinanceError(
+      configSettled.status === 'rejected' ? configSettled.reason : null,
+      'Signed GET /fapi/v1/accountConfig request failed.'
+    );
+    accountConfigEndpointOk = false;
+    accountConfigCanTrade = null;
+    accountConfigErrorCode = err.code;
+    accountConfigErrorMessage = err.message;
+  }
+
+  const bothAuthRejected =
+    !accountEndpointOk &&
+    !accountConfigEndpointOk &&
+    (isBinancePermissionError(accountErrorCode, accountErrorMessage || '') ||
+      isBinancePermissionError(
+        accountConfigErrorCode,
+        accountConfigErrorMessage || ''
+      ));
+
+  const apiAuthenticated =
+    accountEndpointOk || accountConfigEndpointOk || !bothAuthRejected;
+
+  // Non-executing POST /fapi/v1/order/test when authenticated
   let orderTestPassed = false;
   let orderTestMessage = '';
   let orderTestCode: number | null = null;
 
-  try {
-    const testParams = await buildNonExecutingTestOrderParams(
-      binanceRequest,
-      credentials
-    );
-    await binanceRequest<any>(
-      'POST',
-      '/fapi/v1/order/test',
-      testParams,
-      true,
-      credentials
-    );
-    orderTestPassed = true;
-    orderTestMessage =
-      'Binance Demo POST /fapi/v1/order/test passed without placing an order.';
-    orderTestCode = null;
-  } catch (err: any) {
+  if (apiAuthenticated) {
+    try {
+      const testParams = await buildNonExecutingTestOrderParams(
+        binanceRequest,
+        credentials,
+        dualSidePosition
+      );
+      await binanceRequest<any>(
+        'POST',
+        '/fapi/v1/order/test',
+        testParams,
+        true,
+        credentials
+      );
+      orderTestPassed = true;
+      orderTestMessage =
+        'Binance Demo POST /fapi/v1/order/test passed without placing an order.';
+      orderTestCode = null;
+    } catch (err: any) {
+      const parsed = extractBinanceError(
+        err,
+        'Binance Demo POST /fapi/v1/order/test failed.'
+      );
+      orderTestPassed = false;
+      orderTestMessage = parsed.message;
+      orderTestCode = parsed.code;
+    }
+  } else {
     orderTestPassed = false;
     orderTestMessage =
-      err?.message || 'Binance Demo POST /fapi/v1/order/test failed.';
-    orderTestCode =
-      typeof err?.code === 'number'
-        ? err.code
-        : typeof err?.status === 'number'
-          ? err.status
-          : null;
+      accountErrorMessage ||
+      accountConfigErrorMessage ||
+      'Signed API authentication rejected.';
+    orderTestCode = accountErrorCode ?? accountConfigErrorCode;
   }
 
   return classifyFuturesPermission({
-    apiAuthenticated: true,
-    canTrade,
+    apiAuthenticated,
+    accountConfigCanTrade,
+    accountEndpointOk,
+    accountErrorCode,
+    accountErrorMessage,
+    accountConfigEndpointOk,
+    accountConfigErrorCode,
+    accountConfigErrorMessage,
     orderTestPassed,
     orderTestMessage,
     orderTestCode,
+    canDeposit,
+    canWithdraw,
+    dualSidePosition,
+    multiAssetsMargin,
+    feeTier,
     walletBalance,
     availableBalance,
     lastVerifiedAt: Date.now(),

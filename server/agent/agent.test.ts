@@ -493,10 +493,19 @@ test('TEST 7 & 8: Successful Demo Entry + Protective Algo Verify + Monitor Closu
     }
     if (endpoint === '/fapi/v3/account') {
       return {
-        canTrade: true,
         totalWalletBalance: '10001.70',
         availableBalance: '10001.70',
         totalUnrealizedProfit: '0',
+      };
+    }
+    if (endpoint === '/fapi/v1/accountConfig') {
+      return {
+        canTrade: true,
+        canDeposit: true,
+        canWithdraw: true,
+        dualSidePosition: true,
+        multiAssetsMargin: false,
+        feeTier: 0,
       };
     }
     if (endpoint === '/fapi/v3/positionRisk') {

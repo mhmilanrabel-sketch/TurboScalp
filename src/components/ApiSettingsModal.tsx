@@ -122,19 +122,51 @@ export function ApiSettingsModal({
 
       const diag: FuturesPermissionDiagnostics = {
         environment: 'USD_M_FUTURES_DEMO',
+        restEndpoint: result.restEndpoint || 'https://demo-fapi.binance.com',
+        authenticated: result.authenticated ?? result.apiAuthenticated ?? true,
         apiAuthenticated: result.apiAuthenticated ?? true,
-        apiAuthStatus: result.apiAuthStatus ?? 'AUTHENTICATED',
+        apiAuthStatus: result.apiAuthStatus ?? 'VERIFIED',
+        walletBalance: wallet,
+        availableBalance: available,
+        accountCanTrade: null,
+        accountConfigCanTrade:
+          typeof result.accountConfigCanTrade === 'boolean'
+            ? result.accountConfigCanTrade
+            : null,
         canTrade: Boolean(result.canTrade),
-        canTradeStatus: result.canTrade ? 'ENABLED' : 'DISABLED',
+        canTradeStatus:
+          result.canTradeStatus ??
+          (result.accountConfigCanTrade === true
+            ? 'ENABLED'
+            : result.accountConfigCanTrade === false
+              ? 'DISABLED'
+              : 'UNKNOWN'),
+        accountPermissionStatus:
+          result.accountPermissionStatus ??
+          (result.accountConfigCanTrade === true
+            ? 'ENABLED'
+            : result.accountConfigCanTrade === false
+              ? 'DISABLED'
+              : 'UNKNOWN'),
+        canDeposit: result.canDeposit ?? null,
+        canWithdraw: result.canWithdraw ?? null,
+        dualSidePosition: result.dualSidePosition ?? null,
+        multiAssetsMargin: result.multiAssetsMargin ?? null,
+        feeTier: result.feeTier ?? null,
         orderTestPassed: Boolean(result.orderTestPassed),
         orderTestStatus: result.orderTestPassed ? 'PASSED' : 'FAILED',
         orderTestMessage: String(result.orderTestMessage || ''),
         orderTestCode: result.orderTestCode ?? null,
+        accountEndpointOk: result.accountEndpointOk ?? true,
+        accountErrorCode: result.accountErrorCode ?? null,
+        accountErrorMessage: result.accountErrorMessage ?? null,
+        accountConfigEndpointOk: result.accountConfigEndpointOk ?? false,
+        accountConfigErrorCode: result.accountConfigErrorCode ?? null,
+        accountConfigErrorMessage: result.accountConfigErrorMessage ?? null,
+        permissionStatus: result.permissionStatus ?? 'ACCOUNT_PERMISSION_UNKNOWN',
         classificationCode: result.classificationCode,
         classificationMessage: result.classificationMessage,
         tradingConfirmed: Boolean(result.tradingConfirmed),
-        walletBalance: wallet,
-        availableBalance: available,
         lastVerifiedAt: result.lastVerifiedAt || Date.now(),
       };
 
@@ -205,13 +237,15 @@ export function ApiSettingsModal({
 
       let wallet = Number(verification.walletBalance || walletBalance || 0);
       let available = Number(verification.availableBalance || availableBalance || 0);
-      let accountCanTrade = verification.canTrade;
+      let configCanTrade = verification.accountConfigCanTrade === true;
 
       try {
         const account = await getBinanceAccount();
         wallet = Number(account.totalWalletBalance || wallet);
         available = Number(account.availableBalance || available);
-        accountCanTrade = Boolean(account.canTrade);
+        if (typeof account.accountConfigCanTrade === 'boolean') {
+          configCanTrade = account.accountConfigCanTrade === true;
+        }
       } catch {
         // Preserve values from verification response if secondary account read fails.
       }
@@ -220,7 +254,7 @@ export function ApiSettingsModal({
         connected: true,
         walletBalance: wallet,
         availableBalance: available,
-        canTrade: accountCanTrade,
+        canTrade: configCanTrade,
         diagnostics: verification,
       });
 

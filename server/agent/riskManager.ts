@@ -54,6 +54,8 @@ export interface QuantCandidateInput {
 export interface AccountSnapshotInput {
   connected: boolean;
   canTrade: boolean;
+  accountCanTrade?: boolean | null;
+  accountConfigCanTrade?: boolean | null;
   orderTestPassed?: boolean;
   orderTestMessage?: string;
   availableBalance: number;
@@ -187,11 +189,17 @@ export function evaluateRisk(input: RiskEvaluationInput): RiskDecision {
         : `Signal score ${input.signal.signalStrengthScore}/100 is below minimum ${minScore}/100.`
   );
 
-  // 2. Binance Demo API connected, canTrade=true, AND non-executing order test passed
+  // 2. Binance Demo API connected, authoritative /fapi/v1/accountConfig canTrade=true, AND order test passed
+  const accountConfigCanTrade =
+    input.account.accountConfigCanTrade !== undefined
+      ? input.account.accountConfigCanTrade
+      : input.account.canTrade;
+  const accountPermsEnabled =
+    input.account.canTrade === true && accountConfigCanTrade === true;
   const orderTestConfirmed = input.account.orderTestPassed === true;
   const apiReady =
     input.account.connected &&
-    input.account.canTrade &&
+    accountPermsEnabled &&
     orderTestConfirmed &&
     Number.isFinite(input.account.availableBalance) &&
     input.account.availableBalance > 0;
@@ -200,15 +208,17 @@ export function evaluateRisk(input: RiskEvaluationInput): RiskDecision {
     apiReady,
     !input.account.connected
       ? 'Binance Demo API session is disconnected.'
-      : !input.account.canTrade
-        ? 'FUTURES ACCOUNT TRADING DISABLED (account.canTrade=false).'
-        : !orderTestConfirmed
-          ? input.account.orderTestMessage
-            ? `FUTURES API ORDER PERMISSION NOT CONFIRMED (${input.account.orderTestMessage}).`
-            : 'FUTURES API ORDER PERMISSION NOT CONFIRMED (POST /fapi/v1/order/test not verified).'
-          : input.account.availableBalance <= 0
-            ? 'Available Binance Demo USDT balance is zero.'
-            : `Demo API & order validation confirmed ($${input.account.availableBalance.toFixed(2)} available).`
+      : accountConfigCanTrade === null
+        ? 'FUTURES ACCOUNT TRADING PERMISSION: UNKNOWN.'
+        : !accountPermsEnabled
+          ? 'ACCOUNT TRADING DISABLED.'
+          : !orderTestConfirmed
+            ? input.account.orderTestMessage
+              ? `POST /fapi/v1/order/test failed: ${input.account.orderTestMessage}`
+              : 'POST /fapi/v1/order/test not verified.'
+            : input.account.availableBalance <= 0
+              ? 'Available Binance Demo USDT balance is zero.'
+              : `Demo API & /fapi/v1/accountConfig permission confirmed ($${input.account.availableBalance.toFixed(2)} available).`
   );
 
   // 3. Stale market data check

@@ -636,6 +636,7 @@ app.post('/api/binance/disconnect', (req, res) => {
 app.get('/api/binance/config', (req, res) => {
   const session = getSessionRecord(req, false);
   const connected = Boolean(session);
+  const diag = session?.diagnostics ?? null;
   res.json({
     success: true,
     environment: 'USD_M_FUTURES_DEMO',
@@ -643,7 +644,13 @@ app.get('/api/binance/config', (req, res) => {
     liveTradingEnabled: false,
     maxOrderUsd: MAX_ORDER_USD,
     maxLeverage: MAX_LEVERAGE,
-    diagnostics: session?.diagnostics ?? null,
+    canTrade: diag?.accountConfigCanTrade === true,
+    accountCanTrade: null,
+    accountConfigCanTrade: diag?.accountConfigCanTrade ?? null,
+    permissionStatus:
+      diag?.permissionStatus ??
+      (connected ? 'ACCOUNT_PERMISSION_UNKNOWN' : 'DISCONNECTED'),
+    diagnostics: diag,
   });
 });
 
@@ -657,7 +664,7 @@ app.post('/api/binance/test', async (req, res) => {
     if (!session) {
       const disconnectedDiag = classifyFuturesPermission({
         apiAuthenticated: false,
-        canTrade: false,
+        accountConfigCanTrade: null,
         orderTestPassed: false,
         orderTestMessage: 'Binance account is not connected.',
         orderTestCode: 401,
@@ -695,37 +702,118 @@ app.post('/api/binance/test', async (req, res) => {
 app.get('/api/binance/account', async (req, res) => {
   try {
     const session = getSessionRecord(req, true)!;
-    const account = await binanceRequest<any>(
-      'GET',
-      '/fapi/v3/account',
-      {},
-      true,
-      { apiKey: session.apiKey, apiSecret: session.apiSecret }
+    const creds = { apiKey: session.apiKey, apiSecret: session.apiSecret };
+
+    // Use GET /fapi/v3/account strictly for balances, uPnL, assets (never canTrade).
+    // Use GET /fapi/v1/accountConfig as the authoritative source for canTrade and config fields.
+    const [account, accountConfigResult] = await Promise.all([
+      binanceRequest<any>('GET', '/fapi/v3/account', {}, true, creds),
+      binanceRequest<any>('GET', '/fapi/v1/accountConfig', {}, true, creds).then(
+        (cfg) => ({ ok: true as const, cfg }),
+        (err) => ({ ok: false as const, err })
+      ),
+    ]);
+
+    const accountConfigCanTrade: boolean | null =
+      accountConfigResult.ok &&
+      typeof accountConfigResult.cfg?.canTrade === 'boolean'
+        ? accountConfigResult.cfg.canTrade === true
+        : null;
+    const canDeposit =
+      accountConfigResult.ok &&
+      typeof accountConfigResult.cfg?.canDeposit === 'boolean'
+        ? accountConfigResult.cfg.canDeposit
+        : null;
+    const canWithdraw =
+      accountConfigResult.ok &&
+      typeof accountConfigResult.cfg?.canWithdraw === 'boolean'
+        ? accountConfigResult.cfg.canWithdraw
+        : null;
+    const dualSidePosition =
+      accountConfigResult.ok &&
+      typeof accountConfigResult.cfg?.dualSidePosition === 'boolean'
+        ? accountConfigResult.cfg.dualSidePosition
+        : null;
+    const multiAssetsMargin =
+      accountConfigResult.ok &&
+      typeof accountConfigResult.cfg?.multiAssetsMargin === 'boolean'
+        ? accountConfigResult.cfg.multiAssetsMargin
+        : null;
+    const feeTier =
+      accountConfigResult.ok &&
+      typeof accountConfigResult.cfg?.feeTier === 'number' &&
+      Number.isFinite(accountConfigResult.cfg.feeTier)
+        ? accountConfigResult.cfg.feeTier
+        : null;
+
+    const usdt = Array.isArray(account?.assets)
+      ? account.assets.find((item: any) => item.asset === 'USDT')
+      : undefined;
+    const walletBalance = Number(
+      usdt?.walletBalance ?? account?.totalWalletBalance ?? 0
+    );
+    const availableBalance = Number(
+      usdt?.availableBalance ?? account?.availableBalance ?? 0
     );
 
-    const canTrade = Boolean(account.canTrade);
-    if (session.diagnostics && session.diagnostics.canTrade !== canTrade) {
-      session.diagnostics = classifyFuturesPermission({
-        apiAuthenticated: true,
-        canTrade,
-        orderTestPassed: session.diagnostics.orderTestPassed,
-        orderTestMessage: session.diagnostics.orderTestMessage,
-        orderTestCode: session.diagnostics.orderTestCode,
-        walletBalance: Number(account.totalWalletBalance || 0),
-        availableBalance: Number(account.availableBalance || 0),
-        lastVerifiedAt: Date.now(),
-      });
-      updateSessionPermissionDiagnostics(session.diagnostics);
-    }
+    const prevDiag = session.diagnostics;
+    const updatedDiag = classifyFuturesPermission({
+      apiAuthenticated: true,
+      accountConfigCanTrade,
+      accountEndpointOk: true,
+      accountConfigEndpointOk: accountConfigResult.ok,
+      accountConfigErrorCode: accountConfigResult.ok
+        ? null
+        : typeof accountConfigResult.err?.code === 'number'
+          ? accountConfigResult.err.code
+          : typeof accountConfigResult.err?.status === 'number'
+            ? accountConfigResult.err.status
+            : null,
+      accountConfigErrorMessage: accountConfigResult.ok
+        ? null
+        : accountConfigResult.err?.message ||
+          'Signed GET /fapi/v1/accountConfig request failed.',
+      orderTestPassed: prevDiag?.orderTestPassed ?? false,
+      orderTestMessage:
+        prevDiag?.orderTestMessage ??
+        'Run CHECK FUTURES TRADING PERMISSION to validate POST /fapi/v1/order/test.',
+      orderTestCode: prevDiag?.orderTestCode ?? null,
+      canDeposit,
+      canWithdraw,
+      dualSidePosition,
+      multiAssetsMargin,
+      feeTier,
+      walletBalance,
+      availableBalance,
+      lastVerifiedAt: Date.now(),
+    });
+
+    session.diagnostics = updatedDiag;
+    updateSessionPermissionDiagnostics(updatedDiag);
+
+    const canTradeStatus =
+      accountConfigCanTrade === true
+        ? 'ENABLED'
+        : accountConfigCanTrade === false
+          ? 'DISABLED'
+          : 'UNKNOWN';
 
     res.json({
       success: true,
-      canTrade,
+      canTrade: accountConfigCanTrade === true,
+      canTradeStatus,
+      accountCanTrade: null,
+      accountConfigCanTrade,
+      canDeposit,
+      canWithdraw,
+      dualSidePosition,
+      multiAssetsMargin,
+      feeTier,
       totalWalletBalance: account.totalWalletBalance || '0',
       availableBalance: account.availableBalance || '0',
       totalUnrealizedProfit: account.totalUnrealizedProfit || '0',
       assets: account.assets || [],
-      diagnostics: session.diagnostics ?? null,
+      diagnostics: updatedDiag,
     });
   } catch (error) {
     sendApiError(res, error);
@@ -880,7 +968,29 @@ app.post('/api/binance/order', async (req, res) => {
     if (!validateMutationOrigin(req)) {
       throw new BinanceRequestError('Forbidden origin.', 403);
     }
-    const credentials = getSessionCredentials(req)!;
+    const session = getSessionRecord(req, true)!;
+    const credentials = {
+      apiKey: session.apiKey,
+      apiSecret: session.apiSecret,
+    };
+
+    const diag =
+      session.diagnostics ??
+      (await runNonExecutingPermissionDiagnostic(binanceRequest, credentials));
+    session.diagnostics = diag;
+    updateSessionPermissionDiagnostics(diag);
+
+    if (!diag.tradingConfirmed) {
+      throw new BinanceRequestError(
+        diag.classificationMessage || 'ACCOUNT TRADING DISABLED.',
+        403,
+        diag.accountErrorCode ??
+          diag.accountConfigErrorCode ??
+          diag.orderTestCode ??
+          undefined
+      );
+    }
+
     const order = await calculateDemoOrder(req.body);
 
     // Respect account position mode (One-Way vs Hedge)

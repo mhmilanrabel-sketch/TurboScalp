@@ -336,7 +336,8 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
   const tradingConfirmed = Boolean(
     apiConnected &&
       canTrade &&
-      effectiveDiagnostics?.canTrade &&
+      effectiveDiagnostics?.tradingConfirmed &&
+      effectiveDiagnostics?.accountConfigCanTrade === true &&
       effectiveDiagnostics?.orderTestPassed
   );
   const openPosCount = exchangePositions.filter(

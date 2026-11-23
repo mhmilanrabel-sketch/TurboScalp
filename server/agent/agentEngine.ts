@@ -350,6 +350,10 @@ async function runOrchestrationCycle(): Promise<void> {
         aiAnalysis: aiForSymbol,
         account: {
           ...monitorRes.snapshot.account,
+          accountCanTrade: null,
+          accountConfigCanTrade:
+            sessionPermissionDiagnostics?.accountConfigCanTrade ??
+            monitorRes.snapshot.account.canTrade,
           orderTestPassed: sessionPermissionDiagnostics?.orderTestPassed === true,
           orderTestMessage: sessionPermissionDiagnostics?.orderTestMessage,
         },
@@ -711,21 +715,21 @@ export function registerAgentEngineRoutes(
         if (!diag.apiAuthenticated) {
           return res.status(401).json({
             success: false,
-            error: diag.orderTestMessage || 'Binance Demo authentication failed.',
+            error:
+              diag.classificationMessage ||
+              diag.orderTestMessage ||
+              'Binance Demo authentication failed.',
             diagnostics: diag,
           });
         }
-        if (!diag.canTrade || !recon.snapshot.account.canTrade) {
+        if (
+          !diag.tradingConfirmed ||
+          diag.accountConfigCanTrade !== true ||
+          !recon.snapshot.account.canTrade
+        ) {
           return res.status(403).json({
             success: false,
-            error: 'FUTURES ACCOUNT TRADING DISABLED.',
-            diagnostics: diag,
-          });
-        }
-        if (!diag.orderTestPassed) {
-          return res.status(403).json({
-            success: false,
-            error: `${diag.classificationMessage} (${diag.orderTestMessage}${diag.orderTestCode !== null ? ` [Code ${diag.orderTestCode}]` : ''})`,
+            error: diag.classificationMessage || 'ACCOUNT TRADING DISABLED.',
             diagnostics: diag,
           });
         }
@@ -831,13 +835,16 @@ export function registerAgentEngineRoutes(
         creds
       );
       sessionPermissionDiagnostics = diag;
-      if (!diag.apiAuthenticated || !diag.canTrade || !diag.orderTestPassed) {
+      if (
+        !diag.apiAuthenticated ||
+        !diag.tradingConfirmed ||
+        diag.accountConfigCanTrade !== true ||
+        !diag.orderTestPassed
+      ) {
         autoTradingEnabled = false;
         return res.status(403).json({
           success: false,
-          error: !diag.canTrade
-            ? 'FUTURES ACCOUNT TRADING DISABLED.'
-            : `${diag.classificationMessage} (${diag.orderTestMessage}${diag.orderTestCode !== null ? ` [Code ${diag.orderTestCode}]` : ''})`,
+          error: diag.classificationMessage || 'ACCOUNT TRADING DISABLED.',
           diagnostics: diag,
         });
       }

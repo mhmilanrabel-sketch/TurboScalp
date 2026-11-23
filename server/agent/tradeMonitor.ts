@@ -67,12 +67,26 @@ export async function readExchangeSnapshot(
     };
   }
 
-  const [acct, posRisk, openOrders, algoOrders] = await Promise.all([
-    binanceRequest<any>('GET', '/fapi/v3/account', {}, true, credentials),
-    binanceRequest<any[]>('GET', '/fapi/v3/positionRisk', {}, true, credentials),
-    binanceRequest<any[]>('GET', '/fapi/v1/openOrders', {}, true, credentials),
-    fetchOpenAlgoOrdersSafe(binanceRequest, credentials),
-  ]);
+  const [acct, accountConfigSettled, posRisk, openOrders, algoOrders] =
+    await Promise.all([
+      binanceRequest<any>('GET', '/fapi/v3/account', {}, true, credentials),
+      binanceRequest<any>(
+        'GET',
+        '/fapi/v1/accountConfig',
+        {},
+        true,
+        credentials
+      ).catch(() => null),
+      binanceRequest<any[]>(
+        'GET',
+        '/fapi/v3/positionRisk',
+        {},
+        true,
+        credentials
+      ),
+      binanceRequest<any[]>('GET', '/fapi/v1/openOrders', {}, true, credentials),
+      fetchOpenAlgoOrdersSafe(binanceRequest, credentials),
+    ]);
 
   const usdtAsset = Array.isArray(acct?.assets)
     ? acct.assets.find((a: any) => a.asset === 'USDT')
@@ -107,10 +121,13 @@ export async function readExchangeSnapshot(
   const regList = Array.isArray(openOrders) ? openOrders : [];
   const algoList = Array.isArray(algoOrders) ? algoOrders : [];
 
+  // Authoritative trading permission comes strictly from GET /fapi/v1/accountConfig.
+  const canTrade = accountConfigSettled?.canTrade === true;
+
   return {
     account: {
       connected: true,
-      canTrade: Boolean(acct?.canTrade),
+      canTrade,
       availableBalance,
       totalWalletBalance,
       totalUnrealizedProfit,
