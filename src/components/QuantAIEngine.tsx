@@ -15,6 +15,8 @@ import {
   ShieldCheck,
   Wallet
 } from 'lucide-react';
+import type { FuturesPermissionDiagnostics } from '../services/binanceService';
+import { PermissionDiagnosticsCard } from './PermissionDiagnosticsCard';
 
 type AccountSummary = {
   availableBalance: string;
@@ -91,6 +93,9 @@ type Props = {
   accountError: string;
   positions: any[];
   openOrders: any[];
+  permissionDiagnostics?: FuturesPermissionDiagnostics | null;
+  checkingPermission?: boolean;
+  onCheckPermission?: () => Promise<void>;
   onRefreshAccount: () => Promise<void>;
   onOpenApiSettings: () => void;
 };
@@ -205,6 +210,9 @@ export function QuantAIEngine({
   accountError,
   positions,
   openOrders,
+  permissionDiagnostics = null,
+  checkingPermission = false,
+  onCheckPermission,
   onRefreshAccount,
   onOpenApiSettings
 }: Props) {
@@ -300,7 +308,15 @@ export function QuantAIEngine({
 
     if (!account.canTrade) {
       setError(
-        'Binance Demo reports that trading is disabled. Check API permissions.'
+        'FUTURES ACCOUNT TRADING DISABLED. Binance Demo reports account.canTrade is false.'
+      );
+      return;
+    }
+
+    if (!permissionDiagnostics?.orderTestPassed) {
+      setError(
+        permissionDiagnostics?.classificationMessage ||
+          'FUTURES API ORDER PERMISSION NOT CONFIRMED. Run CHECK FUTURES TRADING PERMISSION first.'
       );
       return;
     }
@@ -609,15 +625,17 @@ export function QuantAIEngine({
                       type="button"
                       aria-label="Start or resume Binance Demo autonomous bot"
                       onClick={() => void startBot()}
-                      disabled={loading || accountLoading}
+                      disabled={loading || accountLoading || !account.canTrade || permissionDiagnostics?.orderTestPassed !== true}
                       title={
                         !account.canTrade
-                          ? 'Click to check Binance Demo trading permissions.'
-                          : Number(account.availableBalance) <= 0
-                            ? 'Click to check available Demo margin.'
-                            : 'Start or resume the Binance Demo autonomous bot.'
+                          ? 'FUTURES ACCOUNT TRADING DISABLED.'
+                          : permissionDiagnostics?.orderTestPassed !== true
+                            ? 'Run CHECK FUTURES TRADING PERMISSION to confirm POST /fapi/v1/order/test.'
+                            : Number(account.availableBalance) <= 0
+                              ? 'Click to check available Demo margin.'
+                              : 'Start or resume the Binance Demo autonomous bot.'
                       }
-                      className="relative z-10 flex flex-1 cursor-pointer touch-manipulation items-center justify-center gap-2 rounded-lg bg-cyan-400 p-4 text-[9px] font-black text-slate-950 hover:bg-cyan-300 disabled:cursor-wait disabled:opacity-40"
+                      className="relative z-10 flex flex-1 cursor-pointer touch-manipulation items-center justify-center gap-2 rounded-lg bg-cyan-400 p-4 text-[9px] font-black text-slate-950 hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {loading
                         ? <RefreshCw size={15} className="animate-spin" />
@@ -647,6 +665,16 @@ export function QuantAIEngine({
                   </button>
 
                 </div>
+                {onCheckPermission && (
+                  <PermissionDiagnosticsCard
+                    apiConnected={apiConnected}
+                    canTrade={account.canTrade}
+                    diagnostics={permissionDiagnostics}
+                    checking={checkingPermission}
+                    onCheckPermission={onCheckPermission}
+                    compact
+                  />
+                )}
               </>
             )}
 

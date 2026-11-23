@@ -56,6 +56,10 @@ import {
   reconcilePositionAndOrders,
   type ExchangePositionSnapshot,
 } from './tradeMonitor.js';
+import {
+  runNonExecutingPermissionDiagnostic,
+  type FuturesPermissionDiagnostics,
+} from '../permissionDiagnostics.js';
 
 export type EngineRunMode = 'STOPPED' | 'SCAN_ONLY' | 'AUTO_TRADING' | 'PAUSED';
 
@@ -94,6 +98,22 @@ let lastAiAnalysis: { symbol: string; result: GeminiAnalysisResult } | null = nu
 let lastRiskDecision: RiskDecision | null = null;
 let latestExchangePositions: ExchangePositionSnapshot[] = [];
 let latestOpenOrdersCount = 0;
+let sessionPermissionDiagnostics: FuturesPermissionDiagnostics | null = null;
+
+export function updateSessionPermissionDiagnostics(
+  diag: FuturesPermissionDiagnostics | null
+): void {
+  sessionPermissionDiagnostics = diag;
+  if (diag && !diag.tradingConfirmed && mode === 'AUTO_TRADING') {
+    autoTradingEnabled = false;
+    mode = 'PAUSED';
+    setAgentStatus(
+      'execution',
+      'PAUSED',
+      `Auto-trading paused: ${diag.classificationMessage}`
+    );
+  }
+}
 
 let scanProgress: DiscoveryScanProgress = {
   scanning: false,
@@ -328,7 +348,11 @@ async function runOrchestrationCycle(): Promise<void> {
           fetchedAt: q.fetchedAt,
         },
         aiAnalysis: aiForSymbol,
-        account: monitorRes.snapshot.account,
+        account: {
+          ...monitorRes.snapshot.account,
+          orderTestPassed: sessionPermissionDiagnostics?.orderTestPassed === true,
+          orderTestMessage: sessionPermissionDiagnostics?.orderTestMessage,
+        },
         openPositions: monitorRes.snapshot.positions,
         openOrdersCount: monitorRes.snapshot.openOrdersCount,
         symbolFilter: filterMap.get(q.symbol) ?? null,
@@ -504,6 +528,7 @@ export function pauseAutoAgentOnDisconnect(
   autoTradingEnabled = false;
   demoExplicitlyConfirmed = false;
   activeCredentials = null;
+  sessionPermissionDiagnostics = null;
   if (mode === 'AUTO_TRADING') {
     mode = 'PAUSED';
   }
@@ -519,6 +544,7 @@ export function shutdownAutoAgent(): void {
   autoTradingEnabled = false;
   mode = 'STOPPED';
   activeCredentials = null;
+  sessionPermissionDiagnostics = null;
   if (schedulerTimer) {
     clearInterval(schedulerTimer);
     schedulerTimer = null;
@@ -538,6 +564,7 @@ function buildStatusResponse() {
     credentialsBound: Boolean(
       activeCredentials?.apiKey && activeCredentials?.apiSecret
     ),
+    permissionDiagnostics: sessionPermissionDiagnostics,
     config: cfg,
     riskLimits: HARD_RISK_CONSTANTS,
     lastScanAt,
@@ -671,21 +698,42 @@ export function registerAgentEngineRoutes(
         }
 
         const cfg = getAgentConfig();
-        const recon = await reconcilePositionAndOrders(
-          deps!.binanceRequest,
-          creds,
-          cfg.cooldownMinutes
-        );
-        if (!recon.snapshot.account.canTrade) {
+        const [recon, diag] = await Promise.all([
+          reconcilePositionAndOrders(
+            deps!.binanceRequest,
+            creds,
+            cfg.cooldownMinutes
+          ),
+          runNonExecutingPermissionDiagnostic(deps!.binanceRequest, creds),
+        ]);
+        sessionPermissionDiagnostics = diag;
+
+        if (!diag.apiAuthenticated) {
+          return res.status(401).json({
+            success: false,
+            error: diag.orderTestMessage || 'Binance Demo authentication failed.',
+            diagnostics: diag,
+          });
+        }
+        if (!diag.canTrade || !recon.snapshot.account.canTrade) {
           return res.status(403).json({
             success: false,
-            error: 'Binance Demo account reports Futures trading permission is disabled.',
+            error: 'FUTURES ACCOUNT TRADING DISABLED.',
+            diagnostics: diag,
+          });
+        }
+        if (!diag.orderTestPassed) {
+          return res.status(403).json({
+            success: false,
+            error: `${diag.classificationMessage} (${diag.orderTestMessage}${diag.orderTestCode !== null ? ` [Code ${diag.orderTestCode}]` : ''})`,
+            diagnostics: diag,
           });
         }
         if (recon.snapshot.account.availableBalance <= 0) {
           return res.status(400).json({
             success: false,
             error: 'Binance Demo available USDT balance must be greater than zero.',
+            diagnostics: diag,
           });
         }
 
@@ -776,6 +824,21 @@ export function registerAgentEngineRoutes(
         return res.status(400).json({
           success: false,
           error: 'Explicit Demo-only confirmation required to resume auto trading.',
+        });
+      }
+      const diag = await runNonExecutingPermissionDiagnostic(
+        deps!.binanceRequest,
+        creds
+      );
+      sessionPermissionDiagnostics = diag;
+      if (!diag.apiAuthenticated || !diag.canTrade || !diag.orderTestPassed) {
+        autoTradingEnabled = false;
+        return res.status(403).json({
+          success: false,
+          error: !diag.canTrade
+            ? 'FUTURES ACCOUNT TRADING DISABLED.'
+            : `${diag.classificationMessage} (${diag.orderTestMessage}${diag.orderTestCode !== null ? ` [Code ${diag.orderTestCode}]` : ''})`,
+          diagnostics: diag,
         });
       }
       activeCredentials = creds;

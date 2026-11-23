@@ -9,27 +9,21 @@ import {
   disconnectBinanceDemo,
   testBinanceConnection,
   getBinanceAccount,
-  type BinanceConnectionState
+  type BinanceConnectionState,
+  type FuturesPermissionDiagnostics,
 } from '../services/binanceService';
+import { PermissionDiagnosticsCard } from './PermissionDiagnosticsCard';
 
 interface Props {
-
   isOpen: boolean;
-
   onClose: () => void;
-
   connected: boolean;
-
   walletBalance: number;
-
   availableBalance: number;
-
   canTrade: boolean;
-
-  onConnectionChange: (
-    state: BinanceConnectionState
-  ) => void;
-
+  permissionDiagnostics?: FuturesPermissionDiagnostics | null;
+  onDiagnosticsUpdate?: (diag: FuturesPermissionDiagnostics | null) => void;
+  onConnectionChange: (state: BinanceConnectionState) => void;
 }
 
 // ======================================================
@@ -37,41 +31,33 @@ interface Props {
 // ======================================================
 
 export function ApiSettingsModal({
-
   isOpen,
-
   onClose,
-
   connected,
-
   walletBalance,
-
   availableBalance,
-
   canTrade,
-
-  onConnectionChange
-
+  permissionDiagnostics = null,
+  onDiagnosticsUpdate,
+  onConnectionChange,
 }: Props) {
 
   const [apiKey, setApiKey] = useState('');
-
   const [apiSecret, setApiSecret] = useState('');
-
   const [showSecret, setShowSecret] = useState(false);
-
   const [loading, setLoading] = useState(false);
-
   const [message, setMessage] = useState('');
-
   const [error, setError] = useState(false);
-
   const [showCredentialForm, setShowCredentialForm] =
     useState(!connected);
+  const [localDiagnostics, setLocalDiagnostics] =
+    useState<FuturesPermissionDiagnostics | null>(permissionDiagnostics);
 
-  const [verifiedAt, setVerifiedAt] = useState<string | null>(
-    null
-  );
+  useEffect(() => {
+    setLocalDiagnostics(permissionDiagnostics);
+  }, [permissionDiagnostics]);
+
+  const activeDiagnostics = localDiagnostics ?? permissionDiagnostics;
 
   useEffect(() => {
 
@@ -134,36 +120,42 @@ export function ApiSettingsModal({
         result.availableBalance || 0
       );
 
-      // Tell the parent dashboard immediately.
-
-      onConnectionChange({
-
-        connected: true,
-
+      const diag: FuturesPermissionDiagnostics = {
+        environment: 'USD_M_FUTURES_DEMO',
+        apiAuthenticated: result.apiAuthenticated ?? true,
+        apiAuthStatus: result.apiAuthStatus ?? 'AUTHENTICATED',
+        canTrade: Boolean(result.canTrade),
+        canTradeStatus: result.canTrade ? 'ENABLED' : 'DISABLED',
+        orderTestPassed: Boolean(result.orderTestPassed),
+        orderTestStatus: result.orderTestPassed ? 'PASSED' : 'FAILED',
+        orderTestMessage: String(result.orderTestMessage || ''),
+        orderTestCode: result.orderTestCode ?? null,
+        classificationCode: result.classificationCode,
+        classificationMessage: result.classificationMessage,
+        tradingConfirmed: Boolean(result.tradingConfirmed),
         walletBalance: wallet,
-
         availableBalance: available,
+        lastVerifiedAt: result.lastVerifiedAt || Date.now(),
+      };
 
-        canTrade: Boolean(result.canTrade)
+      setLocalDiagnostics(diag);
+      onDiagnosticsUpdate?.(diag);
 
+      // Tell the parent dashboard immediately.
+      onConnectionChange({
+        connected: true,
+        walletBalance: wallet,
+        availableBalance: available,
+        canTrade: Boolean(result.canTrade),
+        diagnostics: diag,
       });
 
       // Do not keep the credentials in React state.
-
       setApiKey('');
       setApiSecret('');
-
       setShowCredentialForm(false);
-
-      setVerifiedAt(
-        new Date().toLocaleString()
-      );
-
-      setMessage(
-        'Binance Futures Demo authentication successful.'
-      );
-
-      setError(false);
+      setMessage(diag.classificationMessage);
+      setError(!diag.tradingConfirmed);
 
     } catch (err: any) {
 
@@ -183,62 +175,64 @@ export function ApiSettingsModal({
   };
 
   // ====================================================
-  // TEST EXISTING API CONNECTION
+  // TEST EXISTING API CONNECTION & PERMISSIONS
   // ====================================================
 
   const handleTest = async () => {
 
     setLoading(true);
-
     setError(false);
-
-    setMessage(
-      'Checking Binance API authentication...'
-    );
+    setMessage('Running non-executing Binance Futures Demo permission diagnostics...');
 
     try {
+      const verification = await testBinanceConnection();
+      setLocalDiagnostics(verification);
+      onDiagnosticsUpdate?.(verification);
 
-      const verification =
-        await testBinanceConnection();
+      if (!verification.apiAuthenticated) {
+        onConnectionChange({
+          connected: false,
+          diagnostics: verification,
+        });
+        setError(true);
+        setMessage(
+          verification.orderTestCode !== null
+            ? `${verification.classificationMessage} (${verification.orderTestMessage} [Code ${verification.orderTestCode}])`
+            : verification.classificationMessage
+        );
+        return;
+      }
 
-      const account = await getBinanceAccount();
+      let wallet = Number(verification.walletBalance || walletBalance || 0);
+      let available = Number(verification.availableBalance || availableBalance || 0);
+      let accountCanTrade = verification.canTrade;
 
-      const wallet = Number(
-        account.totalWalletBalance || 0
-      );
-
-      const available = Number(
-        account.availableBalance || 0
-      );
+      try {
+        const account = await getBinanceAccount();
+        wallet = Number(account.totalWalletBalance || wallet);
+        available = Number(account.availableBalance || available);
+        accountCanTrade = Boolean(account.canTrade);
+      } catch {
+        // Preserve values from verification response if secondary account read fails.
+      }
 
       onConnectionChange({
-
         connected: true,
-
         walletBalance: wallet,
-
         availableBalance: available,
-
-        canTrade: Boolean(
-          account.canTrade ?? verification.canTrade
-        )
-
+        canTrade: accountCanTrade,
+        diagnostics: verification,
       });
 
-      setVerifiedAt(
-        new Date().toLocaleString()
-      );
-
       setMessage(
-        'API KEY ACTIVE. Authentication and account balance verified successfully.'
+        verification.orderTestCode !== null && !verification.orderTestPassed
+          ? `${verification.classificationMessage} (${verification.orderTestMessage} [Code ${verification.orderTestCode}])`
+          : verification.classificationMessage
       );
-
-      setError(false);
+      setError(!verification.tradingConfirmed);
 
     } catch (err: any) {
-
       setError(true);
-
       setMessage(
         err?.message ||
         'API verification failed. Reconnect your Binance account.'
@@ -248,17 +242,13 @@ export function ApiSettingsModal({
         err?.message?.toLowerCase().includes('session') ||
         err?.message?.includes('401')
       ) {
-
         onConnectionChange({
-          connected: false
+          connected: false,
         });
-
       }
 
     } finally {
-
       setLoading(false);
-
     }
 
   };
@@ -277,8 +267,8 @@ export function ApiSettingsModal({
 
       setApiKey('');
       setApiSecret('');
-
-      setVerifiedAt(null);
+      setLocalDiagnostics(null);
+      onDiagnosticsUpdate?.(null);
 
       setMessage(
         'Binance API disconnected successfully.'
@@ -287,7 +277,8 @@ export function ApiSettingsModal({
       setError(false);
 
       onConnectionChange({
-        connected: false
+        connected: false,
+        diagnostics: null,
       });
 
       setShowCredentialForm(true);
@@ -325,11 +316,12 @@ export function ApiSettingsModal({
 
       setApiKey('');
       setApiSecret('');
-
-      setVerifiedAt(null);
+      setLocalDiagnostics(null);
+      onDiagnosticsUpdate?.(null);
 
       onConnectionChange({
-        connected: false
+        connected: false,
+        diagnostics: null,
       });
 
       setMessage(
@@ -570,46 +562,28 @@ export function ApiSettingsModal({
 
             </div>
 
-            <div className="
-              flex justify-between items-center
-            ">
-
-              <span className="
-                text-[10px] text-slate-400
-              ">
-                Futures trading permission
-              </span>
-
-              <span className={`
-                text-[10px] font-bold
-                ${
-                  canTrade
-                    ? 'text-emerald-400'
-                    : 'text-amber-400'
-                }
-              `}>
-
-                {canTrade ? 'ENABLED' : 'DISABLED'}
-
-              </span>
-
-            </div>
-
-            {verifiedAt && (
-
-              <p className="
-                text-[9px] text-slate-500
-                border-t border-slate-800 pt-2
-              ">
-
-                Last verified: {verifiedAt}
-
-              </p>
-
-            )}
+            <PermissionDiagnosticsCard
+              apiConnected={connected}
+              canTrade={canTrade}
+              diagnostics={activeDiagnostics}
+              checking={loading}
+              onCheckPermission={handleTest}
+              compact
+            />
 
           </div>
 
+        )}
+
+        {!connected && (
+          <PermissionDiagnosticsCard
+            apiConnected={false}
+            canTrade={false}
+            diagnostics={activeDiagnostics}
+            checking={loading}
+            onCheckPermission={handleTest}
+            compact
+          />
         )}
 
         {/* API CREDENTIAL INPUTS */}
@@ -807,7 +781,7 @@ export function ApiSettingsModal({
 
             {loading
               ? 'CHECKING...'
-              : 'RECHECK API & UPDATE BALANCE'
+              : 'RECHECK API, PERMISSIONS & BALANCE'
             }
 
           </button>

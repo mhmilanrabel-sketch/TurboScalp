@@ -28,6 +28,8 @@ import {
   type AgentStatusResponse,
   type OpportunitySnapshot,
 } from '../services/agentService';
+import type { FuturesPermissionDiagnostics } from '../services/binanceService';
+import { PermissionDiagnosticsCard } from './PermissionDiagnosticsCard';
 
 interface MultiAgentPanelProps {
   apiConnected: boolean;
@@ -35,6 +37,9 @@ interface MultiAgentPanelProps {
   availableBalance: string;
   exchangePositions: any[];
   openOrders: any[];
+  permissionDiagnostics: FuturesPermissionDiagnostics | null;
+  checkingPermission: boolean;
+  onCheckPermission: () => Promise<void>;
   onOpenApiSettings: () => void;
   onRefreshAccount: () => Promise<void>;
 }
@@ -205,6 +210,9 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
   availableBalance,
   exchangePositions,
   openOrders,
+  permissionDiagnostics,
+  checkingPermission,
+  onCheckPermission,
   onOpenApiSettings,
   onRefreshAccount,
 }) => {
@@ -323,6 +331,14 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
   const activeTrade = status?.activeTrade;
   const perf = status?.performance;
   const criticalErrors = status?.criticalErrors ?? [];
+  const effectiveDiagnostics =
+    permissionDiagnostics ?? status?.permissionDiagnostics ?? null;
+  const tradingConfirmed = Boolean(
+    apiConnected &&
+      canTrade &&
+      effectiveDiagnostics?.canTrade &&
+      effectiveDiagnostics?.orderTestPassed
+  );
   const openPosCount = exchangePositions.filter(
     (p) => Math.abs(Number(p.positionAmt)) > 1e-12
   ).length;
@@ -381,8 +397,13 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
               setConfirmChecked(false);
               setConfirmAutoModalOpen(true);
             }}
-            disabled={busyAction !== null || autoTrading}
-            className="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-3.5 py-2 text-xs font-bold text-slate-950 transition hover:bg-emerald-400 disabled:opacity-40 whitespace-nowrap shrink-0"
+            disabled={busyAction !== null || autoTrading || (apiConnected && !tradingConfirmed)}
+            title={
+              apiConnected && !tradingConfirmed
+                ? 'Disabled until both Futures Account Can Trade and Demo Order Test pass.'
+                : undefined
+            }
+            className="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-3.5 py-2 text-xs font-bold text-slate-950 transition hover:bg-emerald-400 disabled:opacity-40 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Play className="w-3.5 h-3.5" />
             START DEMO AUTO TRADING
@@ -512,6 +533,15 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
           </p>
         </div>
       </div>
+
+      {/* Futures Trading Permission Diagnostics */}
+      <PermissionDiagnosticsCard
+        apiConnected={apiConnected}
+        canTrade={canTrade}
+        diagnostics={effectiveDiagnostics}
+        checking={checkingPermission}
+        onCheckPermission={onCheckPermission}
+      />
 
       {/* Six Specialist Agent Status Cards */}
       <div>
@@ -1008,9 +1038,9 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
                 <li>Mandatory Algo STOP_MARKET &amp; TAKE_PROFIT_MARKET exits verified on exchange</li>
                 <li>Emergency rollback closes position &amp; pauses entries if protection fails</li>
               </ul>
-              {!canTrade && (
+              {!tradingConfirmed && (
                 <p className="text-rose-300 font-semibold">
-                  Warning: Your Binance Demo API key reports Futures trading permission is disabled.
+                  Warning: {effectiveDiagnostics?.classificationMessage || 'Both Futures Account Can Trade (ENABLED) and Demo Futures Order Test (PASSED) must be confirmed before arming auto trading.'}
                 </p>
               )}
             </div>
@@ -1036,7 +1066,7 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
               </button>
               <button
                 onClick={() => void handleConfirmStartAutoTrading()}
-                disabled={!confirmChecked || !canTrade || busyAction !== null}
+                disabled={!confirmChecked || !tradingConfirmed || busyAction !== null}
                 className="rounded-lg bg-emerald-500 px-4 py-2 text-xs font-bold text-slate-950 hover:bg-emerald-400 disabled:opacity-40"
               >
                 {busyAction === 'START_AUTO' ? 'Arming...' : 'Confirm & Arm Demo Auto Trading'}

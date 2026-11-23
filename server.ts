@@ -25,7 +25,13 @@ import {
   reconcileOnSessionConnected,
   pauseAutoAgentOnDisconnect,
   shutdownAutoAgent,
+  updateSessionPermissionDiagnostics,
 } from './server/agent/agentEngine.js';
+import {
+  classifyFuturesPermission,
+  runNonExecutingPermissionDiagnostic,
+  type FuturesPermissionDiagnostics,
+} from './server/permissionDiagnostics.js';
 
 dotenv.config();
 
@@ -102,6 +108,7 @@ interface UserSession {
   apiKey: string;
   apiSecret: string;
   expiresAt: number;
+  diagnostics?: FuturesPermissionDiagnostics;
 }
 
 const sessions = new Map<string, UserSession>();
@@ -149,10 +156,10 @@ function validateMutationOrigin(req: Request): boolean {
   return true;
 }
 
-function getSessionCredentials(
+function getSessionRecord(
   req: Request,
   required = true
-): BinanceCredentials | null {
+): UserSession | null {
   const sessionId = getCookie(req, SESSION_COOKIE);
 
   if (!sessionId) {
@@ -174,6 +181,15 @@ function getSessionCredentials(
     return null;
   }
 
+  return session;
+}
+
+function getSessionCredentials(
+  req: Request,
+  required = true
+): BinanceCredentials | null {
+  const session = getSessionRecord(req, required);
+  if (!session) return null;
   return {
     apiKey: session.apiKey,
     apiSecret: session.apiSecret,
@@ -183,7 +199,8 @@ function getSessionCredentials(
 function createSession(
   req: Request,
   res: Response,
-  credentials: BinanceCredentials
+  credentials: BinanceCredentials,
+  diagnostics?: FuturesPermissionDiagnostics
 ): void {
   for (const [id, session] of sessions.entries()) {
     if (Date.now() > session.expiresAt) sessions.delete(id);
@@ -198,6 +215,7 @@ function createSession(
     apiKey: credentials.apiKey,
     apiSecret: credentials.apiSecret,
     expiresAt: Date.now() + SESSION_TTL,
+    diagnostics,
   });
 
   const secure =
@@ -580,24 +598,20 @@ app.post('/api/binance/connect', async (req, res) => {
       credentials
     );
 
-    createSession(req, res, credentials);
-    void reconcileOnSessionConnected(credentials);
+    const diagnostics = await runNonExecutingPermissionDiagnostic(
+      binanceRequest,
+      credentials,
+      account
+    );
 
-    const usdt = Array.isArray(account.assets)
-      ? account.assets.find((item: any) => item.asset === 'USDT')
-      : undefined;
+    createSession(req, res, credentials, diagnostics);
+    updateSessionPermissionDiagnostics(diagnostics);
+    void reconcileOnSessionConnected(credentials);
 
     res.json({
       success: true,
-      environment: 'USD_M_FUTURES_DEMO',
-      canTrade: Boolean(account.canTrade),
-      availableBalance: Number(
-        usdt?.availableBalance ?? account.availableBalance ?? 0
-      ),
-      walletBalance: Number(
-        usdt?.walletBalance ?? account.totalWalletBalance ?? 0
-      ),
-      message: 'Binance Futures Demo authentication successful.',
+      ...diagnostics,
+      message: diagnostics.classificationMessage,
     });
   } catch (error) {
     sendApiError(res, error);
@@ -610,6 +624,7 @@ app.post('/api/binance/disconnect', (req, res) => {
   }
   pauseAllAutonomousDemoBots('Binance API disconnected');
   pauseAutoAgentOnDisconnect('Binance API disconnected');
+  updateSessionPermissionDiagnostics(null);
   destroySession(req, res);
 
   res.json({
@@ -619,7 +634,8 @@ app.post('/api/binance/disconnect', (req, res) => {
 });
 
 app.get('/api/binance/config', (req, res) => {
-  const connected = Boolean(getSessionCredentials(req, false));
+  const session = getSessionRecord(req, false);
+  const connected = Boolean(session);
   res.json({
     success: true,
     environment: 'USD_M_FUTURES_DEMO',
@@ -627,6 +643,7 @@ app.get('/api/binance/config', (req, res) => {
     liveTradingEnabled: false,
     maxOrderUsd: MAX_ORDER_USD,
     maxLeverage: MAX_LEVERAGE,
+    diagnostics: session?.diagnostics ?? null,
   });
 });
 
@@ -635,19 +652,40 @@ app.post('/api/binance/test', async (req, res) => {
     if (!validateMutationOrigin(req)) {
       throw new BinanceRequestError('Forbidden origin.', 403);
     }
-    const credentials = getSessionCredentials(req)!;
-    const account = await binanceRequest<any>(
-      'GET',
-      '/fapi/v3/account',
-      {},
-      true,
-      credentials
-    );
 
-    res.json({
+    const session = getSessionRecord(req, false);
+    if (!session) {
+      const disconnectedDiag = classifyFuturesPermission({
+        apiAuthenticated: false,
+        canTrade: false,
+        orderTestPassed: false,
+        orderTestMessage: 'Binance account is not connected.',
+        orderTestCode: 401,
+        lastVerifiedAt: Date.now(),
+      });
+      updateSessionPermissionDiagnostics(null);
+      return res.status(401).json({
+        success: false,
+        ...disconnectedDiag,
+        message: 'Binance account is not connected.',
+      });
+    }
+
+    const diagnostics = await runNonExecutingPermissionDiagnostic(
+      binanceRequest,
+      { apiKey: session.apiKey, apiSecret: session.apiSecret }
+    );
+    session.diagnostics = diagnostics;
+    updateSessionPermissionDiagnostics(diagnostics);
+
+    if (!diagnostics.tradingConfirmed) {
+      pauseAllAutonomousDemoBots(diagnostics.classificationMessage);
+    }
+
+    return res.json({
       success: true,
-      canTrade: Boolean(account.canTrade),
-      message: 'Binance account authenticated successfully.',
+      ...diagnostics,
+      message: diagnostics.classificationMessage,
     });
   } catch (error) {
     sendApiError(res, error);
@@ -656,22 +694,38 @@ app.post('/api/binance/test', async (req, res) => {
 
 app.get('/api/binance/account', async (req, res) => {
   try {
-    const credentials = getSessionCredentials(req)!;
+    const session = getSessionRecord(req, true)!;
     const account = await binanceRequest<any>(
       'GET',
       '/fapi/v3/account',
       {},
       true,
-      credentials
+      { apiKey: session.apiKey, apiSecret: session.apiSecret }
     );
+
+    const canTrade = Boolean(account.canTrade);
+    if (session.diagnostics && session.diagnostics.canTrade !== canTrade) {
+      session.diagnostics = classifyFuturesPermission({
+        apiAuthenticated: true,
+        canTrade,
+        orderTestPassed: session.diagnostics.orderTestPassed,
+        orderTestMessage: session.diagnostics.orderTestMessage,
+        orderTestCode: session.diagnostics.orderTestCode,
+        walletBalance: Number(account.totalWalletBalance || 0),
+        availableBalance: Number(account.availableBalance || 0),
+        lastVerifiedAt: Date.now(),
+      });
+      updateSessionPermissionDiagnostics(session.diagnostics);
+    }
 
     res.json({
       success: true,
-      canTrade: Boolean(account.canTrade),
+      canTrade,
       totalWalletBalance: account.totalWalletBalance || '0',
       availableBalance: account.availableBalance || '0',
       totalUnrealizedProfit: account.totalUnrealizedProfit || '0',
       assets: account.assets || [],
+      diagnostics: session.diagnostics ?? null,
     });
   } catch (error) {
     sendApiError(res, error);

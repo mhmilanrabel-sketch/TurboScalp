@@ -127,6 +127,7 @@ function makeRiskInput(now = 1_750_000_000_000): RiskEvaluationInput {
     account: {
       connected: true,
       canTrade: true,
+      orderTestPassed: true,
       availableBalance: 10_000, // riskAmount = $25; qty = 25/500 = 0.05 BTC ($2500 notional) -> capped at $100 notional = 0.002 BTC
       totalWalletBalance: 10_000,
       totalUnrealizedProfit: 0,
@@ -255,6 +256,7 @@ test('TEST 3: Risk Manager mathematical formula, exchange step/tick rounding & e
   const cases: Array<[string, (i: RiskEvaluationInput) => void]> = [
     ['disconnected', (i) => (i.account.connected = false)],
     ['permission disabled', (i) => (i.account.canTrade = false)],
+    ['order test unconfirmed', (i) => (i.account.orderTestPassed = false)],
     ['stale data', (i) => (i.signal.fetchedAt = now - 120_000)],
     ['low score', (i) => (i.signal.signalStrengthScore = 60)],
     ['AI DEGRADED', (i) => { i.aiAnalysis!.available = false; i.aiAnalysis!.degraded = true; }],
@@ -315,6 +317,7 @@ test('TEST 4: Paper-trading closed-candle simulation enforces limits without exc
       account: {
         connected: true,
         canTrade: true,
+        orderTestPassed: true,
         availableBalance: 2500,
         totalWalletBalance: 2500,
         totalUnrealizedProfit: 0,

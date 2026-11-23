@@ -6,6 +6,7 @@
 import type { Express, Request, Response } from 'express';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { runNonExecutingPermissionDiagnostic } from './permissionDiagnostics.js';
 
 // ── Types ──────────────────────────────────────────────────
 type HttpMethod = 'GET' | 'POST' | 'DELETE';
@@ -751,13 +752,31 @@ export function registerAutonomousDemoBotRoutes(
       activeCredentials = creds;
 
       try {
-        await deps!.binanceRequest(
-          'GET',
-          '/fapi/v3/account',
-          {},
-          true,
+        const diag = await runNonExecutingPermissionDiagnostic(
+          deps!.binanceRequest,
           activeCredentials,
         );
+        if (!diag.apiAuthenticated) {
+          state.status = 'ERROR';
+          state.message = `Demo account verification failed: ${diag.orderTestMessage}`;
+          return res.status(401).json({
+            success: false,
+            error: diag.orderTestMessage || 'Demo credentials rejected by Binance',
+          });
+        }
+        if (!diag.canTrade || !diag.orderTestPassed) {
+          state.status = 'PAUSED';
+          const reason = !diag.canTrade
+            ? 'FUTURES ACCOUNT TRADING DISABLED.'
+            : `${diag.classificationMessage} (${diag.orderTestMessage})`;
+          state.message = reason;
+          addLog('WARN', `Start blocked: ${reason}`);
+          return res.status(403).json({
+            success: false,
+            error: reason,
+            diagnostics: diag,
+          });
+        }
       } catch (err: any) {
         state.status = 'ERROR';
         state.message = `Demo account verification failed: ${err?.message}`;

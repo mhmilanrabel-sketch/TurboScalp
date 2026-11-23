@@ -5,9 +5,11 @@ import {
   getBinanceConfig,
   getBinanceOpenOrders,
   getBinancePositions,
+  testBinanceConnection,
   validateBinanceOrder,
   type BinanceConnectionState,
   type BinanceConfig,
+  type FuturesPermissionDiagnostics,
 } from './services/binanceService';
 import { ApiSettingsModal } from './components/ApiSettingsModal';
 import { MultiAgentPanel } from './components/MultiAgentPanel';
@@ -52,6 +54,9 @@ export default function App() {
   const [openOrders, setOpenOrders] = useState<any[]>([]);
   const [accountError, setAccountError] = useState('');
   const [accountLoading, setAccountLoading] = useState(false);
+  const [permissionDiagnostics, setPermissionDiagnostics] =
+    useState<FuturesPermissionDiagnostics | null>(null);
+  const [checkingPermission, setCheckingPermission] = useState(false);
   const [marketStatus, setMarketStatus] = useState<MarketStatus>('CONNECTING');
   const [lastMarketTick, setLastMarketTick] = useState(0);
   const [clock, setClock] = useState(Date.now());
@@ -83,6 +88,9 @@ export default function App() {
         totalUnrealizedProfit: String(accountData.totalUnrealizedProfit ?? '0'),
         canTrade: Boolean(accountData.canTrade),
       });
+      if (accountData.diagnostics) {
+        setPermissionDiagnostics(accountData.diagnostics);
+      }
       setPositions(Array.isArray(positionData.positions) ? positionData.positions : []);
       setOpenOrders(Array.isArray(orderData.orders) ? orderData.orders : []);
       setApiStatus('CONNECTED');
@@ -94,11 +102,45 @@ export default function App() {
     }
   }, []);
 
+  const handleCheckPermission = useCallback(async () => {
+    setCheckingPermission(true);
+    try {
+      const result = await testBinanceConnection();
+      setPermissionDiagnostics(result);
+      setCredentialsConfigured(result.apiAuthenticated);
+      if (result.apiAuthenticated) {
+        setApiStatus('CONNECTED');
+        setAccount((prev) => ({
+          ...prev,
+          canTrade: result.canTrade,
+          totalWalletBalance:
+            result.walletBalance !== undefined
+              ? String(result.walletBalance)
+              : prev.totalWalletBalance,
+          availableBalance:
+            result.availableBalance !== undefined
+              ? String(result.availableBalance)
+              : prev.availableBalance,
+        }));
+      } else {
+        setApiStatus('DISCONNECTED');
+        setAccount(EMPTY_ACCOUNT);
+        setPositions([]);
+        setOpenOrders([]);
+      }
+    } finally {
+      setCheckingPermission(false);
+    }
+  }, []);
+
   const loadConnection = useCallback(async () => {
     setApiStatus('CHECKING');
     try {
       const config = await getBinanceConfig();
       setServerConfig(config);
+      if (config.diagnostics !== undefined) {
+        setPermissionDiagnostics(config.diagnostics ?? null);
+      }
       const configured = Boolean(config.credentialsConfigured);
       setCredentialsConfigured(configured);
       if (!configured) {
@@ -189,6 +231,9 @@ export default function App() {
 
   const handleConnectionChange = useCallback((connection: BinanceConnectionState) => {
     setCredentialsConfigured(connection.connected);
+    if (connection.diagnostics !== undefined) {
+      setPermissionDiagnostics(connection.diagnostics ?? null);
+    }
     if (connection.connected) {
       setApiStatus('CHECKING');
       void refreshAccount();
@@ -273,8 +318,20 @@ export default function App() {
             <span className={`rounded-md border px-2.5 py-1.5 text-[10px] font-bold ${marketFresh ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-slate-700 bg-slate-900 text-slate-400'}`}>
               {marketFresh ? 'DEMO MARKET FEED LIVE' : `MARKET FEED ${marketStatus}`}
             </span>
-            <span className={`rounded-md border px-2.5 py-1.5 text-[10px] font-bold ${apiVerified ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/30 bg-amber-500/10 text-amber-200'}`}>
-              {apiVerified ? 'DEMO ACCOUNT VERIFIED' : apiStatus === 'CHECKING' ? 'VERIFYING ACCOUNT' : 'DEMO API NOT VERIFIED'}
+            <span
+              className={`rounded-md border px-2.5 py-1.5 text-[10px] font-bold ${
+                apiVerified && account.canTrade && permissionDiagnostics?.orderTestPassed
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                  : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+              }`}
+            >
+              {apiVerified
+                ? account.canTrade && permissionDiagnostics?.orderTestPassed
+                  ? 'DEMO TRADING READY'
+                  : 'API AUTH · TRADING DISABLED'
+                : apiStatus === 'CHECKING'
+                  ? 'VERIFYING ACCOUNT'
+                  : 'DEMO API NOT VERIFIED'}
             </span>
             <button onClick={() => setShowSettings(true)} className="rounded-lg border border-cyan-400/30 bg-cyan-400/10 px-3.5 py-1.5 text-[10px] font-bold tracking-wide text-cyan-200 transition hover:bg-cyan-400/20">
               {credentialsConfigured ? 'DEMO API SETTINGS' : 'CONNECT DEMO API'}
@@ -334,6 +391,9 @@ export default function App() {
             availableBalance={account.availableBalance}
             exchangePositions={positions}
             openOrders={openOrders}
+            permissionDiagnostics={permissionDiagnostics}
+            checkingPermission={checkingPermission}
+            onCheckPermission={handleCheckPermission}
             onOpenApiSettings={() => setShowSettings(true)}
             onRefreshAccount={refreshAccount}
           />
@@ -347,6 +407,9 @@ export default function App() {
             accountError={accountError}
             positions={positions}
             openOrders={openOrders}
+            permissionDiagnostics={permissionDiagnostics}
+            checkingPermission={checkingPermission}
+            onCheckPermission={handleCheckPermission}
             onRefreshAccount={refreshAccount}
             onOpenApiSettings={() => setShowSettings(true)}
           />
@@ -450,7 +513,12 @@ export default function App() {
               </button>
               <button
                 type="button"
-                disabled={!apiVerified || !account.canTrade || manualBusy}
+                disabled={
+                  !apiVerified ||
+                  !account.canTrade ||
+                  permissionDiagnostics?.orderTestPassed !== true ||
+                  manualBusy
+                }
                 onClick={() => void handleManualOrder(false)}
                 className={`rounded-lg px-4 py-2 text-xs font-bold text-slate-950 transition disabled:opacity-40 ${
                   manualSide === 'BUY' ? 'bg-emerald-400 hover:bg-emerald-300' : 'bg-rose-400 hover:bg-rose-300'
@@ -487,6 +555,8 @@ export default function App() {
         walletBalance={walletNum}
         availableBalance={availNum}
         canTrade={account.canTrade}
+        permissionDiagnostics={permissionDiagnostics}
+        onDiagnosticsUpdate={setPermissionDiagnostics}
         onConnectionChange={handleConnectionChange}
       />
       <span className="sr-only">Market data updated {lastMarketTick ? new Date(lastMarketTick).toLocaleTimeString() : 'waiting'}; environment {serverConfig?.environment || 'Demo'}.</span>

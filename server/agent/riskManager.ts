@@ -54,6 +54,8 @@ export interface QuantCandidateInput {
 export interface AccountSnapshotInput {
   connected: boolean;
   canTrade: boolean;
+  orderTestPassed?: boolean;
+  orderTestMessage?: string;
   availableBalance: number;
   totalWalletBalance: number;
   totalUnrealizedProfit: number;
@@ -185,10 +187,12 @@ export function evaluateRisk(input: RiskEvaluationInput): RiskDecision {
         : `Signal score ${input.signal.signalStrengthScore}/100 is below minimum ${minScore}/100.`
   );
 
-  // 2. Binance Demo API connected & trading permission confirmed
+  // 2. Binance Demo API connected, canTrade=true, AND non-executing order test passed
+  const orderTestConfirmed = input.account.orderTestPassed === true;
   const apiReady =
     input.account.connected &&
     input.account.canTrade &&
+    orderTestConfirmed &&
     Number.isFinite(input.account.availableBalance) &&
     input.account.availableBalance > 0;
   record(
@@ -197,10 +201,14 @@ export function evaluateRisk(input: RiskEvaluationInput): RiskDecision {
     !input.account.connected
       ? 'Binance Demo API session is disconnected.'
       : !input.account.canTrade
-        ? 'Binance Demo API Futures trading permission (canTrade) is not confirmed.'
-        : input.account.availableBalance <= 0
-          ? 'Available Binance Demo USDT balance is zero.'
-          : `Demo API verified with $${input.account.availableBalance.toFixed(2)} available margin.`
+        ? 'FUTURES ACCOUNT TRADING DISABLED (account.canTrade=false).'
+        : !orderTestConfirmed
+          ? input.account.orderTestMessage
+            ? `FUTURES API ORDER PERMISSION NOT CONFIRMED (${input.account.orderTestMessage}).`
+            : 'FUTURES API ORDER PERMISSION NOT CONFIRMED (POST /fapi/v1/order/test not verified).'
+          : input.account.availableBalance <= 0
+            ? 'Available Binance Demo USDT balance is zero.'
+            : `Demo API & order validation confirmed ($${input.account.availableBalance.toFixed(2)} available).`
   );
 
   // 3. Stale market data check

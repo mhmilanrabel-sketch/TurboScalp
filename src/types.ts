@@ -396,6 +396,7 @@ export interface AgentStatusResponse {
   autoTradingEnabled: boolean;
   demoExplicitlyConfirmed: boolean;
   credentialsBound: boolean;
+  permissionDiagnostics?: import('./utils/permissionDiagnostics').FuturesPermissionDiagnostics | null;
   config: AgentEngineConfig;
   riskLimits: {
     RISK_PER_TRADE_PCT: number;
