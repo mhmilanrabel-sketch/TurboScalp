@@ -21,9 +21,11 @@ import {
   fetchAgentLogs,
   fetchAgentStatus,
   pauseAgentTrading,
+  recheckGeminiAi,
   resumeAgentEngine,
   startAgentEngine,
   stopAgentNewTrades,
+  updateAgentConfig,
   type AgentLogEntry,
   type AgentStatusResponse,
   type OpportunitySnapshot,
@@ -72,15 +74,27 @@ function agentStateStyle(state: string): string {
   switch (state) {
     case 'ACTIVE':
       return 'text-emerald-400';
+    case 'FALLBACK_ACTIVE':
+    case 'RECOVERING':
+      return 'text-cyan-300';
+    case 'STANDBY':
+      return 'text-slate-300';
     case 'PAUSED':
       return 'text-amber-300';
+    case 'OVERLOADED':
     case 'DEGRADED':
       return 'text-amber-400';
+    case 'QUOTA_EXHAUSTED':
     case 'ERROR':
       return 'text-rose-400';
     default:
       return 'text-slate-400';
   }
+}
+
+function fmtDateTime(ms: number | null | undefined): string {
+  if (!ms) return '—';
+  return new Date(ms).toLocaleString();
 }
 
 function OpportunityCard({
@@ -319,6 +333,38 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
     }
   };
 
+  const handleToggleQuantOnlyPaper = async () => {
+    const nextEnabled = !(status?.config?.quantOnlyPaperMode === true);
+    setBusyAction('POLICY');
+    setActionError('');
+    try {
+      await updateAgentConfig({
+        quantOnlyPaperMode: nextEnabled,
+        tradingPolicy: nextEnabled ? 'QUANT_ONLY_PAPER' : 'GEMINI_REQUIRED',
+      });
+      await refreshData();
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to update trading policy.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleRecheckGemini = async () => {
+    if (busyAction !== null) return;
+    setBusyAction('RECHECK_AI');
+    setActionError('');
+    try {
+      const updated = await recheckGeminiAi();
+      setStatus(updated);
+      await refreshData();
+    } catch (err: any) {
+      setActionError(err?.message || 'Failed to recheck Gemini AI availability.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const mode = status?.mode ?? 'STOPPED';
   const autoTrading = Boolean(status?.autoTradingEnabled);
   const progress = status?.scanProgress;
@@ -327,6 +373,7 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
       ? Math.min(100, Math.round((progress.completedTargets / progress.totalTargets) * 100))
       : 0;
   const aiAnalysis = status?.aiAnalysis;
+  const geminiStatus = status?.geminiStatus;
   const riskDecision = status?.riskDecision;
   const activeTrade = status?.activeTrade;
   const perf = status?.performance;
@@ -346,6 +393,29 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
   const unrealizedTotal =
     status?.unrealizedPnl ??
     exchangePositions.reduce((s, p) => s + (Number(p.unRealizedProfit) || 0), 0);
+
+  const rawGeminiState = geminiStatus?.status ?? 'STANDBY';
+  const geminiState =
+    rawGeminiState === 'ACTIVE' && !geminiStatus?.lastSuccessfulAnalysisAt
+      ? 'STANDBY'
+      : rawGeminiState;
+  const primaryStatusDisplay =
+    geminiStatus?.primaryStatus === 'ACTIVE' && !geminiStatus?.lastSuccessfulAnalysisAt
+      ? 'STANDBY'
+      : geminiStatus?.primaryStatus ?? 'STANDBY';
+  const fallbackModelDisplay = geminiStatus?.fallbackModel || 'NOT CONFIGURED';
+  const fallbackStatusDisplay = geminiStatus?.fallbackModel
+    ? geminiStatus?.fallbackStatus ?? 'STANDBY'
+    : 'DISABLED';
+  const isQuotaExhausted = geminiState === 'QUOTA_EXHAUSTED';
+  const isFallbackActive =
+    geminiState === 'FALLBACK_ACTIVE' || Boolean(geminiStatus?.fallbackActive);
+  const isPrimaryOverloaded =
+    geminiState === 'OVERLOADED' || primaryStatusDisplay === 'OVERLOADED';
+  const isRecovering =
+    geminiState === 'RECOVERING' || primaryStatusDisplay === 'RECOVERING';
+  const isGeminiDegraded = geminiState === 'DEGRADED';
+  const quantOnlyPaperEnabled = status?.config?.quantOnlyPaperMode === true;
 
   return (
     <section className="border border-slate-800 bg-[#0b1322] rounded-2xl p-5 space-y-6">
@@ -544,6 +614,276 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
         onCheckPermission={onCheckPermission}
       />
 
+      {/* GEMINI AI ANALYST — 503 Auto-Recovery, Verified Model Failover & Quota Manager */}
+      <div
+        data-testid="gemini-analyst-status-card"
+        className="border border-slate-800 bg-[#080f1b] rounded-xl p-4 space-y-3.5"
+      >
+        <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between border-b border-slate-800/80 pb-3">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <Brain
+              className={`w-4 h-4 shrink-0 ${
+                isQuotaExhausted
+                  ? 'text-rose-400'
+                  : isFallbackActive || isRecovering
+                    ? 'text-cyan-400'
+                    : isPrimaryOverloaded || isGeminiDegraded
+                      ? 'text-amber-400'
+                      : geminiState === 'ACTIVE'
+                        ? 'text-emerald-400'
+                        : 'text-slate-400'
+              }`}
+            />
+            <h3 className="text-xs font-bold tracking-wider text-white">
+              GEMINI AI ANALYST
+            </h3>
+            <span
+              data-testid="gemini-status-badge"
+              className={`text-xs font-black tracking-wide ${
+                isQuotaExhausted
+                  ? 'text-rose-400'
+                  : isFallbackActive || isRecovering
+                    ? 'text-cyan-300'
+                    : isPrimaryOverloaded || isGeminiDegraded
+                      ? 'text-amber-300'
+                      : geminiState === 'ACTIVE'
+                        ? 'text-emerald-400'
+                        : 'text-slate-300'
+              }`}
+            >
+              Status: {geminiState}
+            </span>
+            {isFallbackActive && (
+              <span
+                data-testid="gemini-fallback-active-badge"
+                className="rounded border border-cyan-500/50 bg-cyan-500/15 px-2 py-0.5 text-[10px] font-bold tracking-wider text-cyan-200"
+              >
+                FALLBACK ACTIVE ({fallbackModelDisplay})
+              </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 text-[11px]">
+            <span className="text-slate-400">
+              Trading Policy:{' '}
+              <span className="font-semibold text-cyan-300">
+                GEMINI_REQUIRED = true
+              </span>
+            </span>
+            <span className="text-slate-500 tabular-nums">
+              Quota: {geminiStatus?.requestsUsedToday ?? 0} / {geminiStatus?.maxDailyRequests ?? 12}
+            </span>
+            <button
+              type="button"
+              data-testid="recheck-ai-btn"
+              onClick={() => void handleRecheckGemini()}
+              disabled={busyAction !== null || isQuotaExhausted}
+              title={
+                isQuotaExhausted
+                  ? 'Blocked while daily 429 quota is exhausted.'
+                  : 'Run a single locked recovery probe against Gemini AI.'
+              }
+              className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/15 px-2.5 py-1 text-[11px] font-semibold text-cyan-200 transition hover:bg-cyan-500/25 cursor-pointer disabled:opacity-40 whitespace-nowrap"
+            >
+              <RefreshCw className={`w-3 h-3 ${busyAction === 'RECHECK_AI' ? 'animate-spin' : ''}`} />
+              {busyAction === 'RECHECK_AI' ? 'RECHECKING...' : 'RECHECK AI'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleToggleQuantOnlyPaper()}
+              disabled={busyAction !== null}
+              className={`rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition cursor-pointer disabled:opacity-50 ${
+                quantOnlyPaperEnabled
+                  ? 'border-amber-500/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
+                  : 'border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800'
+              }`}
+            >
+              {quantOnlyPaperEnabled
+                ? 'QUANT_ONLY Paper-Testing: ON (No Orders)'
+                : 'Enable QUANT_ONLY Paper-Testing'}
+            </button>
+          </div>
+        </div>
+
+        {isQuotaExhausted && (
+          <div
+            data-testid="gemini-quota-exhausted-banner"
+            className="flex items-start gap-2.5 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2.5 text-xs text-rose-200"
+          >
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <p className="font-semibold text-rose-100">
+                Gemini daily quota exhausted (429 RESOURCE_EXHAUSTED). Fallback bypass disabled. Technical scanning remains available; AI-dependent automated Demo entries are paused.
+              </p>
+              <p className="text-[11px] text-rose-300/90">
+                Existing open positions continue active reconciliation and protective Algo SL/TP management.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {!isQuotaExhausted && isFallbackActive && (
+          <div
+            data-testid="gemini-fallback-banner"
+            className="flex items-start gap-2.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-100"
+          >
+            <AlertTriangle className="w-4 h-4 text-cyan-300 shrink-0 mt-0.5" />
+            <span>
+              FALLBACK ACTIVE: Primary model <span className="font-mono font-semibold">{geminiStatus?.primaryModel ?? 'gemini-4-hydrogen'}</span> is OVERLOADED (503). Verified fallback <span className="font-mono font-semibold">{fallbackModelDisplay}</span> is serving analysis until cooldown probe completes.
+            </span>
+          </div>
+        )}
+
+        {!isQuotaExhausted && !isFallbackActive && (isPrimaryOverloaded || isGeminiDegraded || isRecovering) && (
+          <div
+            data-testid="gemini-degraded-banner"
+            className="flex items-start gap-2.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"
+          >
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <span>
+              {isRecovering
+                ? `Primary model ${geminiStatus?.primaryModel ?? 'gemini-4-hydrogen'} cooldown expired — awaiting single recovery probe.`
+                : isPrimaryOverloaded
+                  ? `Primary model ${geminiStatus?.primaryModel ?? 'gemini-4-hydrogen'} is OVERLOADED (503 high demand). Circuit breaker active; mathematical scanner & protective monitoring continue while AI-dependent automated entries stay blocked.`
+                  : 'Gemini AI Analyst is temporarily DEGRADED. Mathematical market scanning & protective monitoring remain operational while AI-dependent automated entries stay blocked.'}
+            </span>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 text-xs tabular-nums">
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              PRIMARY MODEL
+            </p>
+            <p
+              data-testid="gemini-primary-model"
+              className="mt-1 font-mono text-[11px] sm:text-xs font-semibold text-cyan-300 break-words"
+            >
+              {geminiStatus?.primaryModel ?? 'gemini-4-hydrogen'}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              PRIMARY STATUS
+            </p>
+            <p
+              data-testid="gemini-primary-status"
+              className={`mt-1 font-bold ${agentStateStyle(primaryStatusDisplay)}`}
+            >
+              {primaryStatusDisplay}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              FALLBACK MODEL
+            </p>
+            <p
+              data-testid="gemini-fallback-model"
+              className={`mt-1 font-mono text-[11px] sm:text-xs font-semibold break-words ${
+                geminiStatus?.fallbackModel ? 'text-slate-200' : 'text-slate-500'
+              }`}
+            >
+              {fallbackModelDisplay}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              FALLBACK STATUS
+            </p>
+            <p
+              data-testid="gemini-fallback-status"
+              className={`mt-1 font-bold ${
+                fallbackStatusDisplay === 'ACTIVE'
+                  ? 'text-cyan-300'
+                  : fallbackStatusDisplay === 'DEGRADED'
+                    ? 'text-amber-400'
+                    : fallbackStatusDisplay === 'STANDBY'
+                      ? 'text-slate-300'
+                      : 'text-slate-500'
+              }`}
+            >
+              {fallbackStatusDisplay}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              REQUEST QUEUE
+            </p>
+            <p
+              data-testid="gemini-request-queue"
+              className="mt-1 font-bold text-white"
+            >
+              {geminiStatus?.pendingRequests ?? 0} pending · {geminiStatus?.candidatesAwaitingAnalysis ?? 0} awaiting
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              CACHE
+            </p>
+            <p
+              data-testid="gemini-cached-count"
+              className="mt-1 font-bold text-emerald-300"
+            >
+              {geminiStatus?.cachedAnalysesCount ?? 0} entries
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              LAST SUCCESSFUL ANALYSIS
+            </p>
+            <p
+              data-testid="gemini-last-success"
+              className="mt-1 text-[11px] leading-snug font-medium text-slate-200 break-words"
+            >
+              {geminiStatus?.lastSuccessfulAnalysisAt
+                ? `${fmtDateTime(geminiStatus.lastSuccessfulAnalysisAt)}${geminiStatus.lastRespondedModel ? ` (${geminiStatus.lastRespondedModel})` : ''}`
+                : 'Never'}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              NEXT RETRY
+            </p>
+            <p
+              data-testid="gemini-next-retry"
+              className="mt-1 text-[11px] font-medium text-amber-200 truncate"
+            >
+              {geminiStatus?.nextRetryAt
+                ? fmtDateTime(geminiStatus.nextRetryAt)
+                : isRecovering
+                  ? 'Probe Ready'
+                  : 'Ready'}
+            </p>
+          </div>
+
+          <div className="rounded-lg border border-slate-800/80 bg-[#070d17] px-3 py-2 col-span-2">
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">
+              LAST ERROR
+            </p>
+            <p
+              data-testid="gemini-last-error"
+              className={`mt-1 text-[11px] truncate ${
+                geminiStatus?.lastApiError ? 'text-rose-300' : 'text-slate-400'
+              }`}
+              title={geminiStatus?.lastApiError ?? 'None'}
+            >
+              {geminiStatus?.lastApiError
+                ? geminiStatus.lastErrorCode
+                  ? `[${geminiStatus.lastErrorCode}] ${geminiStatus.lastApiError}`
+                  : geminiStatus.lastApiError
+                : 'None'}
+            </p>
+          </div>
+        </div>
+      </div>
+
       {/* Six Specialist Agent Status Cards */}
       <div>
         <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">
@@ -631,24 +971,34 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
                 </div>
                 <span
                   className={`text-xs font-semibold ${
-                    aiAnalysis?.result?.degraded
-                      ? 'text-amber-400'
-                      : aiAnalysis?.result?.available
-                        ? 'text-emerald-400'
-                        : 'text-slate-400'
+                    aiAnalysis?.result?.quotaExhausted
+                      ? 'text-rose-400'
+                      : aiAnalysis?.result?.degraded
+                        ? 'text-amber-400'
+                        : aiAnalysis?.result?.usedFallback
+                          ? 'text-cyan-300'
+                          : aiAnalysis?.result?.available
+                            ? 'text-emerald-400'
+                            : 'text-slate-400'
                   }`}
                 >
                   {aiAnalysis
-                    ? aiAnalysis.result.degraded
-                      ? 'DEGRADED'
-                      : `${aiAnalysis.symbol} · ${aiAnalysis.result.marketRegime} · ${aiAnalysis.result.direction}`
-                    : 'Awaiting Scan'}
+                    ? aiAnalysis.result.quotaExhausted
+                      ? 'QUOTA_EXHAUSTED'
+                      : aiAnalysis.result.degraded
+                        ? aiAnalysis.result.errorCategory === 'CAPACITY_503'
+                          ? 'OVERLOADED (503)'
+                          : 'DEGRADED'
+                        : `${aiAnalysis.symbol} · ${aiAnalysis.result.marketRegime} · ${aiAnalysis.result.direction}${aiAnalysis.result.usedFallback ? ' · FALLBACK' : ''}`
+                    : geminiState !== 'STANDBY' && geminiState !== 'ACTIVE'
+                      ? geminiState
+                      : 'Awaiting Qualified Signal'}
                 </span>
               </div>
 
               {aiAnalysis ? (
                 <div className="space-y-2.5 text-xs">
-                  <div className="grid grid-cols-3 gap-2 tabular-nums">
+                  <div className="grid grid-cols-4 gap-2 tabular-nums">
                     <div>
                       <p className="text-[11px] text-slate-500">Sentiment</p>
                       <p className="font-semibold text-slate-200">
@@ -662,13 +1012,27 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
                       </p>
                     </div>
                     <div>
+                      <p className="text-[11px] text-slate-500">Model Used</p>
+                      <p className="font-mono text-[11px] font-semibold text-slate-200 truncate">
+                        {aiAnalysis.result.modelUsed || geminiStatus?.primaryModel || 'gemini-4-hydrogen'}
+                      </p>
+                    </div>
+                    <div>
                       <p className="text-[11px] text-slate-500">Status</p>
                       <p
                         className={`font-semibold ${
-                          aiAnalysis.result.available ? 'text-emerald-400' : 'text-amber-300'
+                          aiAnalysis.result.usedFallback
+                            ? 'text-cyan-300'
+                            : aiAnalysis.result.available
+                              ? 'text-emerald-400'
+                              : 'text-amber-300'
                         }`}
                       >
-                        {aiAnalysis.result.available ? 'Verified Schema' : 'DEGRADED'}
+                        {aiAnalysis.result.usedFallback
+                          ? 'FALLBACK ACTIVE'
+                          : aiAnalysis.result.available
+                            ? 'Verified Schema'
+                            : 'DEGRADED'}
                       </p>
                     </div>
                   </div>

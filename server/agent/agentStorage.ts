@@ -16,7 +16,17 @@ export type AgentName =
   | 'execution'
   | 'monitor';
 
-export type AgentHealthState = 'IDLE' | 'ACTIVE' | 'PAUSED' | 'DEGRADED' | 'ERROR';
+export type AgentHealthState =
+  | 'IDLE'
+  | 'STANDBY'
+  | 'ACTIVE'
+  | 'FALLBACK_ACTIVE'
+  | 'PAUSED'
+  | 'OVERLOADED'
+  | 'RECOVERING'
+  | 'DEGRADED'
+  | 'QUOTA_EXHAUSTED'
+  | 'ERROR';
 
 export interface AgentUnitStatus {
   id: AgentName;
@@ -26,6 +36,8 @@ export interface AgentUnitStatus {
   lastRunAt: number | null;
   detail: string;
 }
+
+export type TradingPolicyMode = 'GEMINI_REQUIRED' | 'QUANT_ONLY_PAPER';
 
 export interface AgentEngineConfig {
   environment: 'USD_M_FUTURES_DEMO';
@@ -37,6 +49,8 @@ export interface AgentEngineConfig {
   maxDailyLossPct: number;
   cooldownMinutes: number;
   requireAiApproval: boolean;
+  tradingPolicy: TradingPolicyMode;
+  quantOnlyPaperMode: boolean;
 }
 
 export const DEFAULT_AGENT_CONFIG: AgentEngineConfig = Object.freeze({
@@ -49,6 +63,8 @@ export const DEFAULT_AGENT_CONFIG: AgentEngineConfig = Object.freeze({
   maxDailyLossPct: 1.0,
   cooldownMinutes: 30,
   requireAiApproval: true,
+  tradingPolicy: 'GEMINI_REQUIRED',
+  quantOnlyPaperMode: false,
 });
 
 export interface SignalLearningSnapshot {
@@ -360,10 +376,17 @@ export function sanitizeConfig(
       5,
       240
     ),
-    requireAiApproval:
-      typeof partial.requireAiApproval === 'boolean'
-        ? partial.requireAiApproval
-        : DEFAULT_AGENT_CONFIG.requireAiApproval,
+    requireAiApproval: true, // GEMINI_REQUIRED is always enforced for automated Demo entries
+    tradingPolicy:
+      partial.tradingPolicy === 'QUANT_ONLY_PAPER' &&
+      partial.quantOnlyPaperMode === true
+        ? 'QUANT_ONLY_PAPER'
+        : 'GEMINI_REQUIRED',
+    quantOnlyPaperMode:
+      partial.tradingPolicy === 'QUANT_ONLY_PAPER' ||
+      partial.quantOnlyPaperMode === true
+        ? Boolean(partial.quantOnlyPaperMode ?? (partial.tradingPolicy === 'QUANT_ONLY_PAPER'))
+        : false,
   };
 }
 

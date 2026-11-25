@@ -15,7 +15,12 @@ const tempJournal = path.join(
   os.tmpdir(),
   `turboscalp-agent-suite-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
 );
+const tempGeminiQuota = path.join(
+  os.tmpdir(),
+  `turboscalp-agent-gemini-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+);
 process.env.TURBOSCALP_AGENT_STORAGE_FILE = tempJournal;
+process.env.TURBOSCALP_GEMINI_STATE_FILE = tempGeminiQuota;
 
 import { filterClosedCandles, type RawKline } from '../quantRoutes.js';
 import {
@@ -211,10 +216,13 @@ test('TEST 2: Quant Agent score >= 65 & Gemini schema validation + DEGRADED hand
   assert.equal(valid.confidence, 0.81);
   assert.equal(valid.marketRegime, 'TRENDING');
 
-  // Gemini throws / unavailable -> strictly reported as DEGRADED
+  // Gemini throws 503 / unavailable -> retries then strictly reported as DEGRADED / OVERLOADED
   clearGeminiAnalystCache();
   const degradedRes = await runGeminiMarketAnalysis(quant, [], {
     bypassCache: true,
+    retryDelaysMs: [1, 1],
+    jitterFn: () => 0,
+    minIntervalMs: 0,
     generateFn: async () => {
       throw new Error('503 Service Unavailable');
     },
@@ -222,7 +230,8 @@ test('TEST 2: Quant Agent score >= 65 & Gemini schema validation + DEGRADED hand
   assert.equal(degradedRes.available, false);
   assert.equal(degradedRes.degraded, true);
   assert.equal(degradedRes.direction, 'HOLD');
-  assert.ok(degradedRes.riskFlags.includes('AI_DEGRADED'));
+  assert.equal(degradedRes.errorCategory, 'CAPACITY_503');
+  assert.ok(degradedRes.riskFlags.some((f) => /DEGRADED|OVERLOADED/i.test(f)));
 });
 
 test('TEST 3: Risk Manager mathematical formula, exchange step/tick rounding & every rejection rule', () => {
@@ -623,5 +632,8 @@ test('TEST 7 & 8: Successful Demo Entry + Protective Algo Verify + Monitor Closu
 });
 
 test.after(async () => {
-  await fs.rm(tempJournal, { force: true }).catch(() => {});
+  await Promise.all([
+    fs.rm(tempJournal, { force: true }).catch(() => {}),
+    fs.rm(tempGeminiQuota, { force: true }).catch(() => {}),
+  ]);
 });

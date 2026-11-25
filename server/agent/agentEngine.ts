@@ -34,8 +34,13 @@ import {
   type DemoCredentials,
 } from './executionManager.js';
 import {
-  runGeminiMarketAnalysis,
+  analyzeQualifiedCandidatesBatch,
+  ensureGeminiManagerLoaded,
+  getGeminiQuotaStatus,
+  recheckGeminiAvailability,
+  setGeminiAwaitingCandidatesCount,
   type GeminiAnalysisResult,
+  type GeminiQuotaStatusSnapshot,
 } from './geminiAnalyst.js';
 import {
   discoverTopLiquidMarkets,
@@ -99,6 +104,7 @@ let lastRiskDecision: RiskDecision | null = null;
 let latestExchangePositions: ExchangePositionSnapshot[] = [];
 let latestOpenOrdersCount = 0;
 let sessionPermissionDiagnostics: FuturesPermissionDiagnostics | null = null;
+let lastLoggedQuotaErrorKey = '';
 
 export function updateSessionPermissionDiagnostics(
   diag: FuturesPermissionDiagnostics | null
@@ -187,6 +193,119 @@ function setAgentStatus(
   };
 }
 
+function syncAiAnalystAgentCard(
+  qStatus: GeminiQuotaStatusSnapshot,
+  primaryAi?: GeminiAnalysisResult,
+  cacheHits = 0,
+  symbol?: string
+): void {
+  const cacheLabel = cacheHits > 0 ? ` (${cacheHits} cached)` : '';
+  if (qStatus.status === 'QUOTA_EXHAUSTED') {
+    setAgentStatus(
+      'aiAnalyst',
+      'QUOTA_EXHAUSTED',
+      qStatus.quotaMessage || qStatus.lastApiError || 'Gemini daily quota exhausted'
+    );
+    const logKey = `QUOTA:${qStatus.dateUtc}:${qStatus.geminiBlockedUntil ?? qStatus.requestsUsedToday}`;
+    if (lastLoggedQuotaErrorKey !== logKey) {
+      lastLoggedQuotaErrorKey = logKey;
+      appendAgentLog(
+        'AGENT_3_GEMINI',
+        'WARN',
+        `${qStatus.quotaMessage || 'Gemini daily quota exhausted.'} (${qStatus.lastErrorCode || qStatus.lastApiError || '429 RESOURCE_EXHAUSTED'})`,
+        symbol
+      );
+    }
+    return;
+  }
+
+  if (qStatus.status === 'FALLBACK_ACTIVE') {
+    setAgentStatus(
+      'aiAnalyst',
+      'FALLBACK_ACTIVE',
+      primaryAi
+        ? `FALLBACK (${primaryAi.modelUsed || qStatus.fallbackModel}): ${primaryAi.symbol} · ${primaryAi.marketRegime} · ${primaryAi.direction} (${(primaryAi.confidence * 100).toFixed(0)}%)${cacheLabel}`
+        : `Fallback active: ${qStatus.fallbackModel} (primary ${qStatus.primaryModel} overloaded 503)`
+    );
+    const logKey = `FALLBACK:${qStatus.fallbackModel}:${qStatus.primaryCircuitOpenUntil ?? ''}`;
+    if (lastLoggedQuotaErrorKey !== logKey) {
+      lastLoggedQuotaErrorKey = logKey;
+      appendAgentLog(
+        'AGENT_3_GEMINI',
+        'WARN',
+        `Primary model ${qStatus.primaryModel} overloaded (503 UNAVAILABLE). Failover active on verified fallback ${qStatus.fallbackModel}.`,
+        symbol
+      );
+    }
+    return;
+  }
+
+  if (qStatus.status === 'OVERLOADED') {
+    setAgentStatus(
+      'aiAnalyst',
+      'OVERLOADED',
+      qStatus.lastApiError || `${qStatus.primaryModel} overloaded (503 UNAVAILABLE)`
+    );
+    const logKey = `OVERLOADED:${qStatus.lastErrorCode ?? ''}:${qStatus.primaryCircuitOpenUntil ?? ''}`;
+    if (lastLoggedQuotaErrorKey !== logKey) {
+      lastLoggedQuotaErrorKey = logKey;
+      appendAgentLog(
+        'AGENT_3_GEMINI',
+        'ERROR',
+        `Primary ${qStatus.primaryModel} OVERLOADED (${qStatus.lastErrorCode || '503 UNAVAILABLE'}): ${qStatus.lastApiError || 'High demand circuit breaker open'}`,
+        symbol
+      );
+    }
+    return;
+  }
+
+  if (qStatus.status === 'RECOVERING') {
+    setAgentStatus(
+      'aiAnalyst',
+      'RECOVERING',
+      `Cooldown elapsed — awaiting single recovery probe for ${qStatus.primaryModel}`
+    );
+    return;
+  }
+
+  if (qStatus.status === 'DEGRADED') {
+    setAgentStatus(
+      'aiAnalyst',
+      'DEGRADED',
+      qStatus.lastApiError || 'Gemini AI unavailable — AI Analyst is DEGRADED'
+    );
+    const logKey = `DEGRADED:${qStatus.lastErrorCategory}:${qStatus.lastErrorCode ?? ''}:${qStatus.nextRetryAt ?? ''}`;
+    if (lastLoggedQuotaErrorKey !== logKey) {
+      lastLoggedQuotaErrorKey = logKey;
+      appendAgentLog(
+        'AGENT_3_GEMINI',
+        'ERROR',
+        `[${qStatus.lastErrorCategory}] ${qStatus.lastApiError || 'Gemini AI unavailable — AI Analyst is DEGRADED'}`,
+        symbol
+      );
+    }
+    return;
+  }
+
+  if (qStatus.status === 'ACTIVE' && qStatus.lastSuccessfulAnalysisAt !== null) {
+    lastLoggedQuotaErrorKey = '';
+    setAgentStatus(
+      'aiAnalyst',
+      'ACTIVE',
+      primaryAi
+        ? `${primaryAi.symbol} (${primaryAi.modelUsed || qStatus.model}): ${primaryAi.marketRegime} · ${primaryAi.direction} (${(primaryAi.confidence * 100).toFixed(0)}%)${cacheLabel}`
+        : `Gemini ACTIVE (${qStatus.lastRespondedModel || qStatus.primaryModel} · ${qStatus.requestsUsedToday}/${qStatus.maxDailyRequests} used today)`
+    );
+    return;
+  }
+
+  setAgentStatus(
+    'aiAnalyst',
+    'STANDBY',
+    `Standby (${qStatus.primaryModel}) — waiting for qualified setup (${qStatus.requestsUsedToday}/${qStatus.maxDailyRequests} used today)`
+  );
+}
+
 function ensureSchedulerRunning(): void {
   if (schedulerTimer) return;
   schedulerTimer = setInterval(() => {
@@ -207,6 +326,7 @@ async function runOrchestrationCycle(): Promise<void> {
 
   try {
     await ensureAgentStorageLoaded();
+    await ensureGeminiManagerLoaded();
     const cfg = getAgentConfig();
 
     // Agent 6: Always reconcile exchange positions & protective orders (even when paused or stopped)
@@ -294,43 +414,67 @@ async function runOrchestrationCycle(): Promise<void> {
       `Ranked ${quantResults.length} pairs · Actionable BUY=${actionableBuyCount} · SELL=${actionableSellCount}`
     );
 
-    const topCandidate =
-      quantResults.find((q) => q.direction !== 'HOLD') ?? quantResults[0] ?? null;
+    const qualifiedCandidates = quantResults
+      .filter((q) => q.direction !== 'HOLD' && q.signalStrengthScore >= cfg.minSignalScore)
+      .sort((a, b) => b.signalStrengthScore - a.signalStrengthScore);
+
+    const topCandidate = qualifiedCandidates[0] ?? quantResults[0] ?? null;
     if (!topCandidate) {
+      setGeminiAwaitingCandidatesCount(0);
       bestBuyOpportunity = null;
       bestSellOpportunity = null;
       return;
     }
 
-    // Agent 3: Gemini AI Market Analyst on top setup
-    setAgentStatus('aiAnalyst', 'ACTIVE', `Evaluating ${topCandidate.symbol} regime & risk flags`);
-    const aiResult = await runGeminiMarketAnalysis(topCandidate);
-    lastAiAnalysis = { symbol: topCandidate.symbol, result: aiResult };
-    if (aiResult.degraded || !aiResult.available) {
+    // Agent 3: Smart Batched Gemini AI Market Analyst (up to 3 qualified candidates per call)
+    // Never wastes requests on non-actionable HOLD markets.
+    let aiResultsMap = new Map<string, GeminiAnalysisResult>();
+    if (qualifiedCandidates.length > 0) {
+      const preStatus = getGeminiQuotaStatus();
       setAgentStatus(
         'aiAnalyst',
-        'DEGRADED',
-        aiResult.error || 'Gemini AI unavailable — AI Analyst is DEGRADED'
+        preStatus.status === 'RECOVERING' ? 'RECOVERING' : preStatus.status,
+        `Checking up to 3 qualified setups (${qualifiedCandidates.length} awaiting)`
       );
-      appendAgentLog('AGENT_3_GEMINI', 'ERROR', aiResult.reasoning, topCandidate.symbol);
+      const batchOutcome = await analyzeQualifiedCandidatesBatch(
+        qualifiedCandidates.slice(0, 3)
+      );
+      aiResultsMap = batchOutcome.resultsBySymbol;
+
+      const primaryAi = aiResultsMap.get(qualifiedCandidates[0].symbol);
+      if (primaryAi) {
+        lastAiAnalysis = { symbol: qualifiedCandidates[0].symbol, result: primaryAi };
+      }
+
+      syncAiAnalystAgentCard(
+        batchOutcome.quotaStatus,
+        primaryAi,
+        batchOutcome.cacheHits,
+        qualifiedCandidates[0].symbol
+      );
     } else {
-      setAgentStatus(
-        'aiAnalyst',
-        'ACTIVE',
-        `${topCandidate.symbol}: ${aiResult.marketRegime} · ${aiResult.direction} (${(aiResult.confidence * 100).toFixed(0)}%)`
-      );
+      setGeminiAwaitingCandidatesCount(0);
+      const qStatus = getGeminiQuotaStatus();
+      syncAiAnalystAgentCard(qStatus);
+      if (qStatus.status === 'STANDBY' || qStatus.status === 'ACTIVE') {
+        agentStatuses.aiAnalyst = {
+          ...agentStatuses.aiAnalyst,
+          detail: `0 qualified signals (>= ${cfg.minSignalScore}) — skipping Gemini call to conserve quota (${qStatus.requestsUsedToday}/${qStatus.maxDailyRequests})`,
+        };
+      }
     }
 
-    // Agent 4: Mathematical Risk Manager evaluation
+    // Agent 4: Mathematical Risk Manager evaluation (GEMINI_REQUIRED enforced for automated Demo entries)
     const filterMap = new Map<string, ExchangeSymbolFilter>(
       discovered.markets.map((m) => [m.symbol, m.filter])
     );
 
     const runRiskFor = (
-      q: QuantAnalysisResult | null
+      q: QuantAnalysisResult | null,
+      requireAiForDecision = true
     ): OpportunitySnapshot | null => {
       if (!q) return null;
-      const aiForSymbol = q.symbol === topCandidate.symbol ? aiResult : null;
+      const aiForSymbol = aiResultsMap.get(q.symbol) ?? null;
       const clientOrderId = `TS_${q.symbol.slice(0, 8)}_${q.latestClosedCandleTime}`;
       const decision = evaluateRisk({
         signal: {
@@ -368,7 +512,7 @@ async function runOrchestrationCycle(): Promise<void> {
         executionLocked: cycleBusy && inFlightSymbols.size > 0,
         inFlightSymbols,
         duplicateClientOrderExists: hasClientOrderId(clientOrderId),
-        requireAiApproval: cfg.requireAiApproval,
+        requireAiApproval: requireAiForDecision,
         minSignalScore: cfg.minSignalScore,
         maxNotionalUsd: cfg.maxOrderNotionalUsd,
         maxLeverage: cfg.maxLeverage,
@@ -383,15 +527,69 @@ async function runOrchestrationCycle(): Promise<void> {
       };
     };
 
-    bestBuyOpportunity = runRiskFor(bestBuyQuant);
-    bestSellOpportunity = runRiskFor(bestSellQuant);
+    // Always require AI approval (GEMINI_REQUIRED = true) for actual Demo execution risk gates
+    bestBuyOpportunity = runRiskFor(bestBuyQuant, true);
+    bestSellOpportunity = runRiskFor(bestSellQuant, true);
+
+    // Explicitly configured QUANT_ONLY paper-testing evaluation (never auto-activated, never places Demo orders)
+    if (cfg.quantOnlyPaperMode && mode === 'SCAN_ONLY' && qualifiedCandidates.length > 0) {
+      const paperTop = qualifiedCandidates[0];
+      const paperEval = evaluateRisk({
+        signal: {
+          symbol: paperTop.symbol,
+          direction: paperTop.direction,
+          heuristicScore: paperTop.heuristicScore,
+          signalStrengthScore: paperTop.signalStrengthScore,
+          trendStrength: paperTop.trendStrength,
+          price: paperTop.price,
+          stopLoss: paperTop.stopLoss,
+          takeProfit: paperTop.takeProfit,
+          atr14: paperTop.atr14,
+          volatilityPct: paperTop.volatilityPct,
+          latestClosedCandleTime: paperTop.latestClosedCandleTime,
+          fetchedAt: paperTop.fetchedAt,
+        },
+        aiAnalysis: null,
+        account: {
+          connected: true,
+          canTrade: true,
+          accountCanTrade: null,
+          accountConfigCanTrade: true,
+          orderTestPassed: true,
+          availableBalance: monitorRes.snapshot.account.availableBalance || 5000,
+          totalWalletBalance: monitorRes.snapshot.account.totalWalletBalance || 5000,
+          totalUnrealizedProfit: 0,
+        },
+        openPositions: [],
+        openOrdersCount: 0,
+        symbolFilter: filterMap.get(paperTop.symbol) ?? null,
+        dailyEquity: {
+          ...getDailyEquityState(),
+          realizedPnlToday: getTodayRealizedPnl(),
+        },
+        cooldownUntilMs: getSymbolCooldown(paperTop.symbol),
+        executionLocked: false,
+        inFlightSymbols: new Set(),
+        duplicateClientOrderExists: false,
+        requireAiApproval: false,
+        minSignalScore: cfg.minSignalScore,
+        maxNotionalUsd: cfg.maxOrderNotionalUsd,
+        maxLeverage: cfg.maxLeverage,
+      });
+      appendAgentLog(
+        'AGENT_2_QUANT',
+        'INFO',
+        `[QUANT_ONLY PAPER TEST] ${paperTop.direction} ${paperTop.symbol} score=${paperTop.signalStrengthScore}/100 · RiskCheck=${paperEval.approved ? 'PAPER_READY' : `PAPER_SKIP (${paperEval.reasons[0]})`} (zero exchange orders placed).`,
+        paperTop.symbol
+      );
+    }
 
     const topOpportunity =
       topCandidate.direction === 'BUY'
         ? bestBuyOpportunity
         : topCandidate.direction === 'SELL'
           ? bestSellOpportunity
-          : runRiskFor(topCandidate);
+          : runRiskFor(topCandidate, true);
 
     const decision = topOpportunity?.riskDecision ?? null;
     lastRiskDecision = decision;
@@ -458,11 +656,12 @@ async function runOrchestrationCycle(): Promise<void> {
       decision.orderPlan
     ) {
       const symFilter = filterMap.get(topCandidate.symbol);
-      if (symFilter) {
+      const topAiResult = aiResultsMap.get(topCandidate.symbol) ?? null;
+      if (symFilter && topAiResult?.available && !topAiResult.degraded && !topAiResult.quotaExhausted) {
         const execRes = await executeApprovedOrder(
           decision,
           topCandidate,
-          aiResult,
+          topAiResult,
           symFilter,
           {
             credentials: activeCredentials,
@@ -558,6 +757,7 @@ export function shutdownAutoAgent(): void {
 function buildStatusResponse() {
   const perf = getPerformanceSummary();
   const cfg = getAgentConfig();
+  const geminiStatus = getGeminiQuotaStatus();
   return {
     success: true,
     environment: 'USD_M_FUTURES_DEMO' as const,
@@ -582,6 +782,7 @@ function buildStatusResponse() {
       candidates: latestCandidates.slice(0, 12),
     },
     aiAnalysis: lastAiAnalysis,
+    geminiStatus,
     riskDecision: lastRiskDecision,
     activeTrade: getActiveTradeRecord(),
     exchangePositions: latestExchangePositions,
@@ -605,8 +806,8 @@ export function registerAgentEngineRoutes(
 ): void {
   deps = dependencies;
 
-  // Startup initialization: NEVER auto-start automated trading; recover journal cleanly.
-  void ensureAgentStorageLoaded().then(() => {
+  // Startup initialization: NEVER auto-start automated trading; recover journal & Gemini quota state cleanly.
+  void Promise.all([ensureAgentStorageLoaded(), ensureGeminiManagerLoaded()]).then(() => {
     const active = getActiveTradeRecord();
     if (active) {
       markUncertainStartupTrades(active);
@@ -616,10 +817,12 @@ export function registerAgentEngineRoutes(
         `Restored open ${active.symbol} from journal (awaiting Demo session for exchange check)`
       );
     }
+    const qStatus = getGeminiQuotaStatus();
+    syncAiAnalystAgentCard(qStatus);
   });
 
   app.get('/api/agent/status', async (_req: Request, res: Response) => {
-    await ensureAgentStorageLoaded();
+    await Promise.all([ensureAgentStorageLoaded(), ensureGeminiManagerLoaded()]);
     res.json(buildStatusResponse());
   });
 
@@ -647,12 +850,13 @@ export function registerAgentEngineRoutes(
   });
 
   app.get('/api/agent/config', async (_req: Request, res: Response) => {
-    await ensureAgentStorageLoaded();
+    await Promise.all([ensureAgentStorageLoaded(), ensureGeminiManagerLoaded()]);
     res.json({
       success: true,
       environment: 'USD_M_FUTURES_DEMO',
       liveTradingEnabled: false,
       config: getAgentConfig(),
+      geminiStatus: getGeminiQuotaStatus(),
       hardLimits: HARD_RISK_CONSTANTS,
     });
   });
@@ -661,13 +865,44 @@ export function registerAgentEngineRoutes(
     if (deps?.validateMutationOrigin && !deps.validateMutationOrigin(req)) {
       return res.status(403).json({ success: false, error: 'Cross-origin mutation rejected.' });
     }
+    await ensureGeminiManagerLoaded();
     const updated = await updateAgentConfig(req.body as Partial<AgentEngineConfig>);
     appendAgentLog(
       'SYSTEM',
       'INFO',
-      `Agent config updated (minSignalScore=${updated.minSignalScore}, requireAiApproval=${updated.requireAiApproval}, cooldown=${updated.cooldownMinutes}m).`
+      `Agent config updated (minSignalScore=${updated.minSignalScore}, policy=${updated.tradingPolicy}, quantOnlyPaperMode=${updated.quantOnlyPaperMode}, cooldown=${updated.cooldownMinutes}m).`
     );
-    return res.json({ success: true, config: updated });
+    return res.json({
+      success: true,
+      config: updated,
+      geminiStatus: getGeminiQuotaStatus(),
+    });
+  });
+
+  app.post('/api/agent/gemini/recheck', async (req: Request, res: Response) => {
+    if (deps?.validateMutationOrigin && !deps.validateMutationOrigin(req)) {
+      return res.status(403).json({ success: false, error: 'Cross-origin mutation rejected.' });
+    }
+    try {
+      await Promise.all([ensureAgentStorageLoaded(), ensureGeminiManagerLoaded()]);
+      const cfg = getAgentConfig();
+      const qualifiedCandidates = latestCandidates
+        .filter((q) => q.direction !== 'HOLD' && q.signalStrengthScore >= cfg.minSignalScore)
+        .slice(0, 3);
+      const geminiStatus = await recheckGeminiAvailability(qualifiedCandidates);
+      syncAiAnalystAgentCard(geminiStatus);
+      appendAgentLog(
+        'AGENT_3_GEMINI',
+        geminiStatus.status === 'ACTIVE' || geminiStatus.status === 'FALLBACK_ACTIVE' ? 'INFO' : 'WARN',
+        `Manual RECHECK AI completed: status=${geminiStatus.status}, primary=${geminiStatus.primaryModel} (${geminiStatus.primaryStatus}), fallback=${geminiStatus.fallbackModel || 'NOT CONFIGURED'} (${geminiStatus.fallbackStatus}).`
+      );
+      return res.json(buildStatusResponse());
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        error: err?.message || 'Failed to recheck Gemini AI availability.',
+      });
+    }
   });
 
   app.post('/api/agent/start', async (req: Request, res: Response) => {

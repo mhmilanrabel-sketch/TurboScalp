@@ -172,8 +172,45 @@ export type AgentName =
   | 'execution'
   | 'monitor';
 
-export type AgentHealthState = 'IDLE' | 'ACTIVE' | 'PAUSED' | 'DEGRADED' | 'ERROR';
+export type AgentHealthState =
+  | 'IDLE'
+  | 'STANDBY'
+  | 'ACTIVE'
+  | 'FALLBACK_ACTIVE'
+  | 'PAUSED'
+  | 'OVERLOADED'
+  | 'RECOVERING'
+  | 'DEGRADED'
+  | 'QUOTA_EXHAUSTED'
+  | 'ERROR';
 export type EngineRunMode = 'STOPPED' | 'SCAN_ONLY' | 'AUTO_TRADING' | 'PAUSED';
+export type GeminiManagerStatus =
+  | 'STANDBY'
+  | 'ACTIVE'
+  | 'FALLBACK_ACTIVE'
+  | 'OVERLOADED'
+  | 'RECOVERING'
+  | 'DEGRADED'
+  | 'QUOTA_EXHAUSTED';
+export type GeminiPrimaryStatus =
+  | 'STANDBY'
+  | 'ACTIVE'
+  | 'OVERLOADED'
+  | 'RECOVERING'
+  | 'DEGRADED';
+export type GeminiFallbackStatus = 'STANDBY' | 'ACTIVE' | 'DEGRADED' | 'DISABLED';
+export type GeminiErrorCategory =
+  | 'NONE'
+  | 'CAPACITY_503'
+  | 'QUOTA_429'
+  | 'RATE_LIMIT_429'
+  | 'TIMEOUT_504'
+  | 'INVALID_ARGUMENT_400'
+  | 'AUTH_401_403'
+  | 'NETWORK_ERROR'
+  | 'CONFIG_ERROR'
+  | 'SCHEMA_ERROR';
+export type TradingPolicyMode = 'GEMINI_REQUIRED' | 'QUANT_ONLY_PAPER';
 
 export interface AgentUnitStatus {
   id: AgentName;
@@ -194,6 +231,8 @@ export interface AgentEngineConfig {
   maxDailyLossPct: number;
   cooldownMinutes: number;
   requireAiApproval: boolean;
+  tradingPolicy: TradingPolicyMode;
+  quantOnlyPaperMode: boolean;
 }
 
 export interface QuantAnalysisResult {
@@ -238,6 +277,11 @@ export interface GeminiAnalysisResult {
   symbol: string;
   available: boolean;
   degraded: boolean;
+  quotaExhausted?: boolean;
+  fromCache?: boolean;
+  modelUsed?: string;
+  usedFallback?: boolean;
+  errorCategory?: GeminiErrorCategory;
   direction: 'BUY' | 'SELL' | 'HOLD';
   marketRegime: 'TRENDING' | 'SIDEWAYS' | 'VOLATILE' | 'CONFLICTED';
   confidence: number;
@@ -246,6 +290,35 @@ export interface GeminiAnalysisResult {
   reasoning: string;
   error?: string;
   analyzedAt: number;
+}
+
+export interface GeminiQuotaStatusSnapshot {
+  status: GeminiManagerStatus;
+  model: string;
+  primaryModel: string;
+  primaryStatus: GeminiPrimaryStatus;
+  fallbackModel: string | null;
+  fallbackVerified: boolean;
+  fallbackStatus: GeminiFallbackStatus;
+  fallbackActive: boolean;
+  lastRespondedModel: string | null;
+  requestsUsedToday: number;
+  maxDailyRequests: number;
+  pendingRequests: number;
+  cachedAnalysesCount: number;
+  lastSuccessfulAnalysisAt: number | null;
+  lastApiError: string | null;
+  lastErrorCode: string | null;
+  lastErrorCategory: GeminiErrorCategory;
+  geminiBlockedUntil: number | null;
+  primaryCircuitOpenUntil: number | null;
+  consecutive503Cycles: number;
+  nextRetryAt: number | null;
+  candidatesAwaitingAnalysis: number;
+  quotaMessage: string | null;
+  promptVersion: string;
+  featureVersion: string;
+  dateUtc: string;
 }
 
 export interface RiskCheckItem {
@@ -424,6 +497,7 @@ export interface AgentStatusResponse {
     candidates: QuantAnalysisResult[];
   };
   aiAnalysis: { symbol: string; result: GeminiAnalysisResult } | null;
+  geminiStatus?: GeminiQuotaStatusSnapshot;
   riskDecision: RiskDecision | null;
   activeTrade: AgentTradeRecord | null;
   exchangePositions: Array<{

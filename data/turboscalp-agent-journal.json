@@ -9,10 +9,12 @@
     "maxOrderNotionalUsd": 100,
     "maxDailyLossPct": 1,
     "cooldownMinutes": 30,
-    "requireAiApproval": true
+    "requireAiApproval": true,
+    "tradingPolicy": "GEMINI_REQUIRED",
+    "quantOnlyPaperMode": false
   },
   "dailyEquity": {
-    "dateUtc": "2026-11-23",
+    "dateUtc": "2026-11-25",
     "startingEquity": 0,
     "peakEquity": 0
   },
@@ -115,6 +117,20 @@
       "agent": "SYSTEM",
       "level": "INFO",
       "message": "Engine stopped by user."
+    },
+    {
+      "id": "1795609960325-oitc5w",
+      "at": 1795609960325,
+      "agent": "AGENT_3_GEMINI",
+      "level": "ERROR",
+      "message": "[CAPACITY_503] {\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}} | {\"error\":{\"code\":503,\"message\":\"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\"status\":\"UNAVAILABLE\"}} | This model is currently experiencing high demand. Sp"
+    },
+    {
+      "id": "1795609960325-2l85lg",
+      "at": 1795609960325,
+      "agent": "AGENT_3_GEMINI",
+      "level": "WARN",
+      "message": "Manual RECHECK AI completed: status=DEGRADED, primary=gemini-4-hydrogen (OVERLOADED), fallback=NOT CONFIGURED (DISABLED)."
     }
   ],
   "criticalErrors": []

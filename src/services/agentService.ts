@@ -23,10 +23,16 @@ export type {
   ApprovedOrderPlan,
   EngineRunMode,
   GeminiAnalysisResult,
+  GeminiErrorCategory,
+  GeminiFallbackStatus,
+  GeminiManagerStatus,
+  GeminiPrimaryStatus,
+  GeminiQuotaStatusSnapshot,
   OpportunitySnapshot,
   QuantAnalysisResult,
   RiskCheckItem,
   RiskDecision,
+  TradingPolicyMode,
 } from '../types';
 
 async function agentRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
@@ -117,6 +123,12 @@ export function resumeAgentEngine(params?: {
 
 export function stopAgentNewTrades(): Promise<AgentStatusResponse> {
   return agentRequest<AgentStatusResponse>('/api/agent/stop', {
+    method: 'POST',
+  });
+}
+
+export function recheckGeminiAi(): Promise<AgentStatusResponse> {
+  return agentRequest<AgentStatusResponse>('/api/agent/gemini/recheck', {
     method: 'POST',
   });
 }

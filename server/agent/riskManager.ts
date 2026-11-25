@@ -317,11 +317,21 @@ export function evaluateRisk(input: RiskEvaluationInput): RiskDecision {
         !hasCriticalFlag
     );
 
-    let aiDetail = 'Gemini AI Analyst aligned with technical direction.';
-    if (!ai || !ai.available || ai.degraded) {
-      aiDetail = ai?.error
-        ? `AI Analyst DEGRADED: ${ai.error}`
-        : 'AI Analyst is unavailable or DEGRADED while AI approval is required.';
+    let aiDetail = ai?.usedFallback
+      ? `Gemini Fallback (${ai.modelUsed || 'fallback'}) aligned with technical direction.`
+      : 'Gemini AI Analyst aligned with technical direction.';
+    if (!ai || !ai.available || ai.degraded || ai.quotaExhausted) {
+      if (ai?.quotaExhausted || ai?.errorCategory === 'QUOTA_429') {
+        aiDetail =
+          'Gemini daily quota exhausted — AI-dependent automated entries are paused.';
+      } else if (ai?.errorCategory === 'CAPACITY_503') {
+        aiDetail = `AI Analyst OVERLOADED (503 UNAVAILABLE): ${ai.error || 'Model experiencing high demand — automated entries blocked.'}`;
+      } else if (ai?.error) {
+        aiDetail = `AI Analyst DEGRADED${ai.errorCategory && ai.errorCategory !== 'NONE' ? ` (${ai.errorCategory})` : ''}: ${ai.error}`;
+      } else {
+        aiDetail =
+          'AI Analyst is unavailable or DEGRADED while AI approval is required.';
+      }
     } else if (ai.direction !== input.signal.direction) {
       aiDetail = `Technical (${input.signal.direction}) and AI (${ai.direction} · ${ai.marketRegime}) directions conflict.`;
     } else if (ai.confidence < HARD_RISK_CONSTANTS.MIN_AI_CONFIDENCE) {
