@@ -1079,7 +1079,10 @@ export function registerAgentEngineRoutes(
         });
       }
 
-      const quantity = Math.abs(Number(live.positionAmt)).toString();
+      const quantity = String(live.positionAmt).replace(/^-/, '');
+      if (!Number.isFinite(Number(quantity)) || Number(quantity) <= 0) {
+        throw new Error('Binance returned an invalid live position quantity; close was not submitted.');
+      }
       const closeParams: Record<string, any> = {
         symbol: active.symbol,
         side: active.side === 'BUY' ? 'SELL' : 'BUY',
