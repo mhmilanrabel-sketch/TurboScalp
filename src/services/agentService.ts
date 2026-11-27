@@ -127,6 +127,17 @@ export function stopAgentNewTrades(): Promise<AgentStatusResponse> {
   });
 }
 
+export function closeAgentPosition(): Promise<AgentStatusResponse & {
+  alreadyFlat?: boolean;
+  orderId?: number | string | null;
+  message?: string;
+}> {
+  return agentRequest('/api/agent/position/close', {
+    method: 'POST',
+    body: JSON.stringify({ confirm: true }),
+  });
+}
+
 export function recheckGeminiAi(): Promise<AgentStatusResponse> {
   return agentRequest<AgentStatusResponse>('/api/agent/gemini/recheck', {
     method: 'POST',
