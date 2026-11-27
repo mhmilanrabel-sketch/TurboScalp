@@ -1,0 +1,394 @@
+﻿diff --git a/server/agent/agent.test.ts b/server/agent/agent.test.ts
+index 6ad8fce..bdabe68 100644
+--- a/server/agent/agent.test.ts
++++ b/server/agent/agent.test.ts
+@@ -50,6 +50,8 @@ import {
+   getCriticalErrors,
+   getPerformanceSummary,
+   getSymbolCooldown,
++  getLearningSamples,
++  recordTradeClosed,
+   DEFAULT_AGENT_CONFIG,
+   sanitizeConfig,
+   notifyTelegramEvent,
+@@ -472,6 +474,15 @@ test('TEST 5 & 6: Execution Agent Hedge/One-Way Algo Exits, Partial Fill, Ambigu
+   assert.equal(marketCloseCalled, true);
+   assert.equal(pausedCalled, true);
+   assert.equal(rollbackOutcome.tradeRecord?.executionStatus, 'ROLLBACK_CLOSED');
++  assert.equal(rollbackOutcome.tradeRecord?.financialsVerified, false);
++  assert.equal(rollbackOutcome.tradeRecord?.realizedPnl, null);
++  assert.equal(rollbackOutcome.tradeRecord?.netPnl, null);
++  assert.equal(
++    getLearningSamples(20).some(
++      (sample) => sample.tradeId === rollbackOutcome.tradeRecord?.id
++    ),
++    false
++  );
+   assert.ok(getCriticalErrors().length >= 1);
+ 
+   // Verify duplicate clientOrderId is blocked after rollback recorded it
+@@ -645,6 +656,29 @@ test('TEST 7 & 8: Successful Demo Entry + Protective Algo Verify + Monitor Closu
+ 
+   const perf = getPerformanceSummary(10_001.7);
+   assert.equal(perf.wins, 1);
++  const verifiedSample = getLearningSamples(10).find(
++    (sample) => sample.tradeId === execRes.tradeRecord?.id
++  );
++  assert.equal(verifiedSample?.financialsVerified, true);
++  assert.equal(verifiedSample?.netPnl, 1.7);
++
++  // A repeated close for an already-finalized trade must not change PnL or add a sample.
++  const samplesBeforeDuplicateClose = getLearningSamples(10).length;
++  const closedAtBeforeDuplicateClose = execRes.tradeRecord?.closedAt;
++  await recordTradeClosed(execRes.tradeRecord!.id, {
++    status: 'CLOSED',
++    exitPrice: 50900,
++    realizedPnl: 999,
++    tradingFees: 0,
++    fundingFees: 0,
++    closeReason: 'DUPLICATE_CLOSE_REGRESSION_TEST',
++    executionStatus: 'CLOSED',
++    financialsVerified: true,
++  });
++  assert.equal(getLearningSamples(10).length, samplesBeforeDuplicateClose);
++  assert.equal(execRes.tradeRecord?.closedAt, closedAtBeforeDuplicateClose);
++  assert.equal(execRes.tradeRecord?.netPnl, 1.7);
++
+   assert.equal(perf.totalTradingFees, 0.08);
+   assert.equal(perf.totalFundingFees, -0.02);
+   assert.equal(perf.netRealizedPnl, 1.7);
+diff --git a/server/agent/agentStorage.ts b/server/agent/agentStorage.ts
+index 0c8c9c1..be4f097 100644
+--- a/server/agent/agentStorage.ts
++++ b/server/agent/agentStorage.ts
+@@ -135,6 +135,8 @@ export interface AgentTradeRecord {
+   openedAt: number;
+   closedAt: number | null;
+   closeReason: string | null;
++  /** True only when exchange financial history has been validated; absent legacy values are unverified. */
++  financialsVerified?: boolean;
+   signalSnapshot: SignalLearningSnapshot;
+ }
+ 
+@@ -148,6 +150,8 @@ export interface LearningSample {
+   returnPct: number;
+   holdingMs: number;
+   recordedAt: number;
++  /** Only true samples may be used by Qwen or walk-forward learning. */
++  financialsVerified?: boolean;
+   features: SignalLearningSnapshot;
+ }
+ 
+@@ -560,6 +564,8 @@ export function getLastTradeAt(): number | null {
+ 
+ export async function recordTradeOpened(trade: AgentTradeRecord): Promise<void> {
+   await ensureAgentStorageLoaded();
++  // A retry for the same execution must not create a second journal row.
++  if (store.trades.some((existing) => existing.id === trade.id)) return;
+   store.lastTradeAt = trade.openedAt;
+   store.trades.push(trade);
+   if (store.trades.length > MAX_TRADES) {
+@@ -569,8 +575,11 @@ export async function recordTradeOpened(trade: AgentTradeRecord): Promise<void>
+ }
+ 
+ export function getActiveTradeRecord(): AgentTradeRecord | null {
+-  const open = store.trades.filter((t) => t.status === 'OPEN');
+-  return open.length > 0 ? open[open.length - 1] : null;
++  // Uncertain emergency closures remain recoverable until exchange state is checked.
++  const recoverable = store.trades.filter(
++    (t) => t.status === 'OPEN' || t.executionStatus === 'UNCERTAIN_RECOVERY_NEEDED'
++  );
++  return recoverable.length > 0 ? recoverable[recoverable.length - 1] : null;
+ }
+ 
+ export function getRecentTrades(limit = 50): AgentTradeRecord[] {
+@@ -587,8 +596,33 @@ export function getRecentLogs(limit = 150): AgentLogEntry[] {
+     .slice(0, limit);
+ }
+ 
++function isEligibleLearningSample(sample: LearningSample): boolean {
++  if (!sample || sample.financialsVerified !== true) return false;
++  if (typeof sample.tradeId !== 'string' || !sample.tradeId.trim()) return false;
++  if (typeof sample.symbol !== 'string' || !sample.symbol.trim()) return false;
++  if (sample.side !== 'BUY' && sample.side !== 'SELL') return false;
++  if (!Number.isFinite(sample.netPnl) || !Number.isFinite(sample.returnPct)) return false;
++  if (!Number.isFinite(sample.holdingMs) || sample.holdingMs < 0) return false;
++  if (!Number.isFinite(sample.recordedAt) || sample.recordedAt <= 0) return false;
++  if (!sample.features || typeof sample.features !== 'object') return false;
++
++  const expectedOutcome: LearningSample['outcome'] =
++    sample.netPnl > 1e-6 ? 'WIN' : sample.netPnl < -1e-6 ? 'LOSS' : 'FLAT';
++  return sample.outcome === expectedOutcome;
++}
++
+ export function getLearningSamples(limit = 200): LearningSample[] {
+-  return store.learningSamples.slice(-limit);
++  // Keep the latest verified sample per trade; legacy samples without the
++  // explicit marker remain in the journal but are never used for learning.
++  const unique = new Map<string, LearningSample>();
++  for (const sample of store.learningSamples) {
++    if (isEligibleLearningSample(sample)) unique.set(sample.tradeId, sample);
++  }
++  const ordered = Array.from(unique.values()).sort(
++    (a, b) => a.recordedAt - b.recordedAt
++  );
++  const safeLimit = Math.max(0, Math.trunc(Number.isFinite(limit) ? limit : 200));
++  return safeLimit === 0 ? [] : ordered.slice(-safeLimit);
+ }
+ 
+ export async function updateOpenTradeMetrics(
+@@ -626,47 +660,85 @@ export async function recordTradeClosed(
+     fundingFees?: number;
+     closeReason: string;
+     executionStatus?: ExecutionLifecycleStatus;
++    financialsVerified?: boolean;
+   }
+ ): Promise<AgentTradeRecord | null> {
+   await ensureAgentStorageLoaded();
+   const trade = store.trades.find((t) => t.id === tradeId);
+   if (!trade) return null;
+ 
++  // Finalized records cannot be closed twice. An uncertain rollback stays retryable.
++  if (trade.closedAt !== null && trade.executionStatus !== 'UNCERTAIN_RECOVERY_NEEDED') {
++    return trade;
++  }
++
++  const executionStatus = params.executionStatus ?? 'CLOSED';
+   const tradingFees = Math.abs(params.tradingFees);
+   const fundingFees = params.fundingFees ?? trade.fundingFees ?? 0;
+-  const totalCommission = tradingFees;
+-  const netPnl = params.realizedPnl - tradingFees + fundingFees;
++  const financiallyVerified =
++    params.financialsVerified === true &&
++    params.status === 'CLOSED' &&
++    executionStatus === 'CLOSED' &&
++    Number.isFinite(params.realizedPnl) &&
++    Number.isFinite(tradingFees) &&
++    Number.isFinite(fundingFees) &&
++    typeof params.exitPrice === 'number' &&
++    Number.isFinite(params.exitPrice) &&
++    params.exitPrice > 0 &&
++    Number.isFinite(trade.notionalUsd) &&
++    trade.notionalUsd > 0;
++  const wasEmergency =
++    trade.status === 'EMERGENCY_CLOSED' ||
++    trade.executionStatus === 'ROLLBACK_CLOSED' ||
++    /ROLLBACK|CRITICAL_OPEN_EXPOSURE/i.test(trade.closeReason ?? '');
+   const closedAt = Date.now();
+ 
+   trade.status = params.status;
+-  trade.executionStatus = params.executionStatus ?? 'CLOSED';
++  trade.executionStatus = executionStatus;
+   trade.exitPrice = params.exitPrice;
+-  trade.realizedPnl = params.realizedPnl;
+-  trade.tradingFees = tradingFees;
+-  trade.fundingFees = fundingFees;
+-  trade.commission = totalCommission;
+-  trade.netPnl = netPnl;
++  trade.financialsVerified = financiallyVerified;
+   trade.unrealizedPnl = 0;
+   trade.closedAt = closedAt;
+   trade.closeReason = params.closeReason;
+ 
+-  const outcome: LearningSample['outcome'] =
+-    netPnl > 1e-6 ? 'WIN' : netPnl < -1e-6 ? 'LOSS' : 'FLAT';
+-  const returnPct =
+-    trade.notionalUsd > 0 ? (netPnl / trade.notionalUsd) * 100 : 0;
+-
+-  store.learningSamples.push({
+-    id: `sample-${trade.id}`,
+-    tradeId: trade.id,
+-    symbol: trade.symbol,
+-    side: trade.side,
+-    outcome,
+-    netPnl,
+-    returnPct,
+-    holdingMs: Math.max(0, closedAt - trade.openedAt),
+-    recordedAt: closedAt,
+-    features: trade.signalSnapshot,
+-  });
++  if (financiallyVerified) {
++    trade.realizedPnl = params.realizedPnl;
++    trade.tradingFees = tradingFees;
++    trade.fundingFees = fundingFees;
++    trade.commission = tradingFees;
++    trade.netPnl = params.realizedPnl - tradingFees + fundingFees;
++  } else {
++    // Zero values supplied by rollback/fallback code are placeholders, not PnL.
++    trade.realizedPnl = null;
++    trade.netPnl = null;
++  }
++
++  // Emergency rollback trades are retained for audit/recovery, never used as
++  // strategy-learning examples, even when their final exchange PnL is recovered.
++  if (financiallyVerified && !wasEmergency) {
++    const netPnl = trade.netPnl as number;
++    const outcome: LearningSample['outcome'] =
++      netPnl > 1e-6 ? 'WIN' : netPnl < -1e-6 ? 'LOSS' : 'FLAT';
++    const returnPct = (netPnl / trade.notionalUsd) * 100;
++    const sample: LearningSample = {
++      id: `sample-${trade.id}`,
++      tradeId: trade.id,
++      symbol: trade.symbol,
++      side: trade.side,
++      outcome,
++      netPnl,
++      returnPct,
++      holdingMs: Math.max(0, closedAt - trade.openedAt),
++      recordedAt: closedAt,
++      financialsVerified: true,
++      features: trade.signalSnapshot,
++    };
++    const existingIndex = store.learningSamples.findIndex(
++      (item) => item.tradeId === trade.id || item.id === sample.id
++    );
++    if (existingIndex >= 0) store.learningSamples[existingIndex] = sample;
++    else store.learningSamples.push(sample);
++  }
+ 
+   if (store.learningSamples.length > MAX_SAMPLES) {
+     store.learningSamples = store.learningSamples.slice(-MAX_SAMPLES);
+@@ -858,9 +930,9 @@ export function getPerformanceSummary(currentEquity = 0): PerformanceSummary {
+     dailyDrawdownPct: Number(dailyDrawdownPct.toFixed(2)),
+     maxDrawdownUsd: Number(maxDrawdownUsd.toFixed(4)),
+     maxDrawdownPct: Number(maxDrawdownPct.toFixed(2)),
+-    learningSampleCount: store.learningSamples.length,
++    learningSampleCount: getLearningSamples(MAX_SAMPLES).length,
+     equityCurve,
+-    walkForwardReport: buildWalkForwardReport(store.learningSamples),
++    walkForwardReport: buildWalkForwardReport(getLearningSamples(MAX_SAMPLES)),
+   };
+ }
+ 
+diff --git a/server/agent/tradeMonitor.ts b/server/agent/tradeMonitor.ts
+index 0925aea..5adece8 100644
+--- a/server/agent/tradeMonitor.ts
++++ b/server/agent/tradeMonitor.ts
+@@ -185,11 +185,14 @@ export async function reconcilePositionAndOrders(
+   );
+ 
+   if (!livePos) {
+-    // Position became flat: query exchange realized PnL, trading commissions, funding fees, and last trade exit price
++    // A flat position is not enough to establish a financial outcome. Require
++    // exchange income rows and actual fills before finalizing PnL or learning.
+     let realizedPnl = 0;
+     let tradingFees = 0;
+     let fundingFees = 0;
+     let exitPrice: number | null = active.markPrice;
++    let financialsVerified = false;
++    let reconciliationError = 'Exchange income/trade history was incomplete';
+ 
+     try {
+       const [incomes, userTrades] = await Promise.all([
+@@ -209,21 +212,57 @@ export async function reconcilePositionAndOrders(
+         ),
+       ]);
+ 
+-      if (Array.isArray(incomes)) {
+-        for (const inc of incomes) {
+-          const amt = toNum(inc.income);
+-          if (inc.incomeType === 'REALIZED_PNL') realizedPnl += amt;
+-          else if (inc.incomeType === 'COMMISSION') tradingFees += Math.abs(amt);
+-          else if (inc.incomeType === 'FUNDING_FEE') fundingFees += amt;
+-        }
++      if (!Array.isArray(incomes) || !Array.isArray(userTrades)) {
++        throw new Error('Binance returned an invalid income or user-trades response');
+       }
+-      if (Array.isArray(userTrades) && userTrades.length > 0) {
+-        const lastFill = userTrades[userTrades.length - 1];
+-        const px = toNum(lastFill.price);
+-        if (px > 0) exitPrice = px;
++
++      const validIncomeRows = incomes.filter(
++        (row: any) =>
++          ['REALIZED_PNL', 'COMMISSION', 'FUNDING_FEE'].includes(row?.incomeType) &&
++          (typeof row.income === 'string' || typeof row.income === 'number') &&
++          Number.isFinite(Number(row.income))
++      );
++      const realizedRows = validIncomeRows.filter(
++        (row: any) => row.incomeType === 'REALIZED_PNL'
++      );
++      const commissionRows = validIncomeRows.filter(
++        (row: any) => row.incomeType === 'COMMISSION'
++      );
++      const validFills = userTrades.filter(
++        (row: any) =>
++          (typeof row?.price === 'string' || typeof row?.price === 'number') &&
++          Number.isFinite(Number(row.price)) &&
++          Number(row.price) > 0
++      );
++
++      if (realizedRows.length === 0 || commissionRows.length === 0 || validFills.length === 0) {
++        throw new Error('Binance history did not contain realized PnL, commission, and valid fill records');
++      }
++
++      realizedPnl = realizedRows.reduce(
++        (sum: number, row: any) => sum + Number(row.income),
++        0
++      );
++      tradingFees = commissionRows.reduce(
++        (sum: number, row: any) => sum + Math.abs(Number(row.income)),
++        0
++      );
++      fundingFees = validIncomeRows
++        .filter((row: any) => row.incomeType === 'FUNDING_FEE')
++        .reduce((sum: number, row: any) => sum + Number(row.income), 0);
++      const lastFill = validFills[validFills.length - 1];
++      exitPrice = Number(lastFill.price);
++      financialsVerified =
++        Number.isFinite(realizedPnl) &&
++        Number.isFinite(tradingFees) &&
++        Number.isFinite(fundingFees) &&
++        Number.isFinite(exitPrice) &&
++        (exitPrice as number) > 0;
++      if (!financialsVerified) {
++        throw new Error('Binance financial history contained non-finite values');
+       }
+-    } catch {
+-      // Fallback safely if income endpoint returns partial info
++    } catch (err: any) {
++      reconciliationError = err?.message || 'Unable to verify Binance financial history';
+     }
+ 
+     // Cancel any leftover bot-owned protective Algo orders cleanly
+@@ -242,6 +281,32 @@ export async function reconcilePositionAndOrders(
+       active.targetClientAlgoId
+     );
+ 
++    if (!financialsVerified) {
++      // Keep the journal item recoverable and block new entries until history is verified.
++      const alreadyPending = active.executionStatus === 'UNCERTAIN_RECOVERY_NEEDED';
++      await updateOpenTradeMetrics(active.id, {
++        executionStatus: 'UNCERTAIN_RECOVERY_NEEDED',
++      });
++      if (!alreadyPending) {
++        recordCriticalError(
++          'MONITOR_FINANCIAL_RECONCILIATION',
++          `${active.symbol} is flat on the exchange, but PnL/fees could not be verified: ${reconciliationError}`,
++          active.symbol
++        );
++        appendAgentLog(
++          'AGENT_6_MONITOR',
++          'WARN',
++          `${active.symbol} is exchange-flat, but financial reconciliation is pending. The journal remains unresolved and new entries must stay paused.`,
++          active.symbol
++        );
++      }
++      return {
++        snapshot,
++        activeTradeStillOpen: true,
++        reconcileNote: `${active.symbol} is flat on exchange; financial history is unverified. Recovery remains pending.`,
++      };
++    }
++
+     const closed = await recordTradeClosed(active.id, {
+       status: 'CLOSED',
+       exitPrice,
+@@ -250,6 +315,7 @@ export async function reconcilePositionAndOrders(
+       fundingFees,
+       closeReason: 'EXCHANGE_FLAT_RECONCILED',
+       executionStatus: 'CLOSED',
++      financialsVerified: true,
+     });
+ 
+     await startSymbolCooldown(active.symbol, cooldownMinutes);
