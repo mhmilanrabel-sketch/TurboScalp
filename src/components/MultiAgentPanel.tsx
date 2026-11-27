@@ -426,7 +426,7 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
     try {
       await updateAgentConfig({
         quantOnlyPaperMode: nextEnabled,
-        tradingPolicy: nextEnabled ? 'QUANT_ONLY_PAPER' : 'GEMINI_REQUIRED',
+        tradingPolicy: nextEnabled ? 'QUANT_ONLY_PAPER' : 'AI_REQUIRED',
       });
       await refreshData();
     } catch (err: any) {
