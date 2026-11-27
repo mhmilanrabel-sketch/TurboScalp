@@ -18,6 +18,7 @@ import {
   X,
 } from 'lucide-react';
 import {
+  closeAgentPosition,
   fetchAgentLogs,
   fetchAgentStatus,
   pauseAgentTrading,
@@ -414,6 +415,28 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
       await refreshData();
     } catch (err: any) {
       setActionError(err?.message || 'Failed to stop new trades.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleManualClose = async () => {
+    if (!activeTrade || busyAction !== null || !apiConnected) return;
+    const confirmed = window.confirm(
+      `CLOSE ${activeTrade.symbol} ${activeTrade.side} on Binance USD-M Futures DEMO?\n\nThis sends a MARKET close order for the live exchange quantity. The app will only mark the trade closed after Binance confirms the position is flat.\n\nContinue?`
+    );
+    if (!confirmed) return;
+
+    setBusyAction('CLOSE_POSITION');
+    setActionError('');
+    try {
+      const updated = await closeAgentPosition();
+      setStatus(updated);
+      await Promise.all([refreshData(), onRefreshAccount()]);
+    } catch (err: any) {
+      setActionError(err?.message || 'Manual close could not be verified. Check Binance Demo directly before retrying.');
+      await refreshData();
+      await onRefreshAccount();
     } finally {
       setBusyAction(null);
     }
@@ -1524,6 +1547,19 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
                   >
                     {fmtUsd(activeTrade.unrealizedPnl)}
                   </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 pt-3">
+                  <p className="text-[11px] text-slate-400">
+                    Manual close sends a Demo market order and verifies the exchange position before updating history.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void handleManualClose()}
+                    disabled={!apiConnected || busyAction !== null}
+                    className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-2.5 text-[11px] font-bold text-rose-200 hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {busyAction === 'CLOSE_POSITION' ? 'VERIFYING CLOSE…' : 'CLOSE POSITION'}
+                  </button>
                 </div>
               </div>
             ) : openPosCount > 0 ? (
