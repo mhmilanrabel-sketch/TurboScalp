@@ -426,7 +426,7 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
     try {
       await updateAgentConfig({
         quantOnlyPaperMode: nextEnabled,
-        tradingPolicy: nextEnabled ? 'QUANT_ONLY_PAPER' : 'GEMINI_REQUIRED',
+        tradingPolicy: nextEnabled ? 'QUANT_ONLY_PAPER' : 'AI_REQUIRED',
       });
       await refreshData();
     } catch (err: any) {
@@ -760,7 +760,7 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
               }`}
             />
             <h3 className="text-xs font-bold tracking-wider text-white">
-              GEMINI AI ANALYST
+              GEMINI SERVICE (OPTIONAL)
             </h3>
             <span
               data-testid="gemini-status-badge"
@@ -790,9 +790,12 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
 
           <div className="flex flex-wrap items-center gap-2.5 text-[11px]">
             <span className="text-slate-400">
-              Trading Policy:{' '}
+              AI Approval:{' '}
               <span className="font-semibold text-cyan-300">
-                GEMINI_REQUIRED = true
+                REQUIRED
+              </span>
+              <span className="text-slate-500" data-testid="local-qwen-approval-mode">
+                Local Qwen trade approval: {status?.config?.localAiApprovalEnabled ? 'ENABLED' : 'DISABLED (ADVISORY)'}
               </span>
             </span>
             <span className="text-slate-500 tabular-nums">

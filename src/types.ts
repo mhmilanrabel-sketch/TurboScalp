@@ -210,7 +210,7 @@ export type GeminiErrorCategory =
   | 'NETWORK_ERROR'
   | 'CONFIG_ERROR'
   | 'SCHEMA_ERROR';
-export type TradingPolicyMode = 'GEMINI_REQUIRED' | 'QUANT_ONLY_PAPER';
+export type TradingPolicyMode = 'AI_REQUIRED' | 'QUANT_ONLY_PAPER';
 
 export interface AgentUnitStatus {
   id: AgentName;
@@ -231,6 +231,7 @@ export interface AgentEngineConfig {
   maxDailyLossPct: number;
   cooldownMinutes: number;
   requireAiApproval: boolean;
+  localAiApprovalEnabled: boolean;
   tradingPolicy: TradingPolicyMode;
   quantOnlyPaperMode: boolean;
 }
@@ -275,6 +276,7 @@ export interface QuantAnalysisResult {
 
 export interface GeminiAnalysisResult {
   symbol: string;
+  provider?: 'GEMINI' | 'QWEN_LOCAL';
   available: boolean;
   degraded: boolean;
   quotaExhausted?: boolean;
