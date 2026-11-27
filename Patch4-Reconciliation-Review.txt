@@ -1,0 +1,2669 @@
+﻿===== agentStorage.ts =====
+// server/agent/agentStorage.ts
+// Persistent atomic trade journal, configuration, daily loss state,
+// cooldown tracking, critical error log, walk-forward samples,
+// and non-blocking Telegram notifications.
+// Never persists Binance API secrets or Gemini keys.
+
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import axios from 'axios';
+
+export type AgentName =
+  | 'discovery'
+  | 'quant'
+  | 'aiAnalyst'
+  | 'riskManager'
+  | 'execution'
+  | 'monitor';
+
+export type AgentHealthState =
+  | 'IDLE'
+  | 'STANDBY'
+  | 'ACTIVE'
+  | 'FALLBACK_ACTIVE'
+  | 'PAUSED'
+  | 'OVERLOADED'
+  | 'RECOVERING'
+  | 'DEGRADED'
+  | 'QUOTA_EXHAUSTED'
+  | 'ERROR';
+
+export interface AgentUnitStatus {
+  id: AgentName;
+  label: string;
+  role: string;
+  status: AgentHealthState;
+  lastRunAt: number | null;
+  detail: string;
+}
+
+export type TradingPolicyMode = 'AI_REQUIRED' | 'QUANT_ONLY_PAPER';
+
+export interface AgentEngineConfig {
+  environment: 'USD_M_FUTURES_DEMO';
+  minSignalScore: number;
+  riskPerTradePct: number;
+  maxLeverage: number;
+  maxOpenPositions: number;
+  maxOrderNotionalUsd: number;
+  maxDailyLossPct: number;
+  cooldownMinutes: number;
+  requireAiApproval: boolean;
+  /** Local Qwen may satisfy the AI gate only after explicit opt-in. Defaults to false. */
+  localAiApprovalEnabled: boolean;
+  tradingPolicy: TradingPolicyMode;
+  quantOnlyPaperMode: boolean;
+}
+
+export const DEFAULT_AGENT_CONFIG: AgentEngineConfig = Object.freeze({
+  environment: 'USD_M_FUTURES_DEMO',
+  minSignalScore: 65,
+  riskPerTradePct: 0.25,
+  maxLeverage: 2,
+  maxOpenPositions: 1,
+  maxOrderNotionalUsd: 100,
+  maxDailyLossPct: 1.0,
+  cooldownMinutes: 30,
+  requireAiApproval: true,
+  localAiApprovalEnabled: false,
+  tradingPolicy: 'AI_REQUIRED',
+  quantOnlyPaperMode: false,
+});
+
+export interface SignalLearningSnapshot {
+  quantDirection: 'BUY' | 'SELL' | 'HOLD';
+  heuristicScore: number;
+  trendStrength: number;
+  rsi14: number;
+  ema9: number;
+  ema21: number;
+  ema50: number;
+  atr14: number;
+  volatilityPct: number;
+  volumeRatio: number;
+  breakout: 'BULLISH_BREAKOUT' | 'BEARISH_BREAKOUT' | 'NONE';
+  mtfAligned: boolean;
+  marketRegime: 'TRENDING' | 'SIDEWAYS' | 'VOLATILE' | 'CONFLICTED' | 'UNKNOWN';
+  aiDirection: 'BUY' | 'SELL' | 'HOLD' | 'UNAVAILABLE';
+  aiSentiment: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  aiConfidence: number; // 0.0 - 1.0
+  aiRiskFlags: string[];
+  stopDistancePct: number;
+}
+
+export type ExecutionLifecycleStatus =
+  | 'SUBMITTING'
+  | 'FILLED_PROTECTED'
+  | 'PARTIAL_PROTECTED'
+  | 'ROLLBACK_CLOSED'
+  | 'UNCERTAIN_RECOVERY_NEEDED'
+  | 'CLOSED';
+
+export interface AgentTradeRecord {
+  id: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  positionMode: 'ONE_WAY' | 'HEDGE';
+  positionSide: 'BOTH' | 'LONG' | 'SHORT';
+  status: 'OPEN' | 'CLOSED' | 'EMERGENCY_CLOSED';
+  executionStatus: ExecutionLifecycleStatus;
+  requestedQuantity: string;
+  executedQuantity: string;
+  leverage: number;
+  notionalUsd: number;
+  riskUsd: number;
+  entryPrice: number;
+  exitPrice: number | null;
+  markPrice: number;
+  stopPrice: number;
+  takeProfitPrice: number;
+  entryOrderId: number | string | null;
+  entryClientOrderId: string;
+  stopAlgoId: number | string | null;
+  stopClientAlgoId: string;
+  targetAlgoId: number | string | null;
+  targetClientAlgoId: string;
+  emergencyOrderId: number | string | null;
+  stopStatus: 'ARMED' | 'PENDING' | 'FAILED' | 'TRIGGERED' | 'CANCELLED';
+  takeProfitStatus: 'ARMED' | 'PENDING' | 'FAILED' | 'TRIGGERED' | 'CANCELLED';
+  unrealizedPnl: number;
+  realizedPnl: number | null;
+  tradingFees: number;
+  fundingFees: number;
+  commission: number;
+  netPnl: number | null;
+  openedAt: number;
+  closedAt: number | null;
+  closeReason: string | null;
+  /** True only when exchange financial history has been validated; absent legacy values are unverified. */
+  financialsVerified?: boolean;
+  signalSnapshot: SignalLearningSnapshot;
+}
+
+export interface LearningSample {
+  id: string;
+  tradeId: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  outcome: 'WIN' | 'LOSS' | 'FLAT';
+  netPnl: number;
+  returnPct: number;
+  holdingMs: number;
+  recordedAt: number;
+  /** Only true samples may be used by Qwen or walk-forward learning. */
+  financialsVerified?: boolean;
+  features: SignalLearningSnapshot;
+}
+
+export interface AgentLogEntry {
+  id: string;
+  at: number;
+  agent:
+    | 'SYSTEM'
+    | 'AGENT_1_DISCOVERY'
+    | 'AGENT_2_QUANT'
+    | 'AGENT_3_GEMINI'
+    | 'AGENT_4_RISK'
+    | 'AGENT_5_EXECUTION'
+    | 'AGENT_6_MONITOR';
+  level: 'INFO' | 'WARN' | 'ERROR' | 'CRITICAL' | 'TRADE';
+  message: string;
+  symbol?: string;
+}
+
+export interface AgentCriticalError {
+  id: string;
+  at: number;
+  symbol?: string;
+  stage: string;
+  message: string;
+  resolved: boolean;
+}
+
+export interface DailyEquityState {
+  dateUtc: string;
+  startingEquity: number;
+  peakEquity: number;
+}
+
+export interface PersistedAgentJournal {
+  version: number;
+  config: AgentEngineConfig;
+  dailyEquity: DailyEquityState;
+  lastTradeAt: number | null;
+  lastProcessedCandles: Record<string, number>;
+  cooldowns: Record<string, number>;
+  trades: AgentTradeRecord[];
+  learningSamples: LearningSample[];
+  logs: AgentLogEntry[];
+  criticalErrors: AgentCriticalError[];
+}
+
+export interface WalkForwardFold {
+  fold: number;
+  trainCount: number;
+  testCount: number;
+  trainWinRate: number;
+  testWinRate: number;
+  testNetPnl: number;
+  testProfitFactor: number | null;
+}
+
+export interface WalkForwardReport {
+  status: 'READY' | 'INSUFFICIENT_SAMPLES';
+  minimumSamplesRequired: number;
+  availableSamples: number;
+  retrainPolicy: 'PERIODIC_OFFLINE_ONLY';
+  dynamicRiskMutation: false;
+  folds: WalkForwardFold[];
+  summaryNote: string;
+}
+
+export interface PerformanceSummary {
+  totalTrades: number;
+  openTrades: number;
+  closedTrades: number;
+  wins: number;
+  losses: number;
+  winRate: number | null;
+  lossRate: number | null;
+  grossProfit: number;
+  grossLoss: number;
+  profitFactor: number | null;
+  expectancyUsd: number | null;
+  totalRealizedPnl: number;
+  totalTradingFees: number;
+  totalFundingFees: number;
+  totalFees: number;
+  netRealizedPnl: number;
+  todayRealizedPnl: number;
+  dailyStartingEquity: number;
+  dailyDrawdownPct: number;
+  maxDrawdownUsd: number;
+  maxDrawdownPct: number;
+  learningSampleCount: number;
+  equityCurve: Array<{ time: number; cumulativePnl: number; drawdownUsd: number }>;
+  walkForwardReport: WalkForwardReport;
+}
+
+const MAX_TRADES = 2000;
+const MAX_SAMPLES = 2000;
+const MAX_LOGS = 600;
+const MAX_CRITICAL_ERRORS = 200;
+const MIN_WALK_FORWARD_SAMPLES = 6;
+
+function getStorageFilePath(): string {
+  return (
+    process.env.TURBOSCALP_AGENT_STORAGE_FILE ||
+    path.resolve(process.cwd(), 'data', 'turboscalp-agent-journal.json')
+  );
+}
+
+export function utcDateKey(ms = Date.now()): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+const store: PersistedAgentJournal = {
+  version: 2,
+  config: { ...DEFAULT_AGENT_CONFIG },
+  dailyEquity: {
+    dateUtc: utcDateKey(),
+    startingEquity: 0,
+    peakEquity: 0,
+  },
+  lastTradeAt: null,
+  lastProcessedCandles: {},
+  cooldowns: {},
+  trades: [],
+  learningSamples: [],
+  logs: [],
+  criticalErrors: [],
+};
+
+let loaded = false;
+let loadPromise: Promise<void> | null = null;
+let persistChain: Promise<void> = Promise.resolve();
+
+export async function ensureAgentStorageLoaded(): Promise<void> {
+  if (loaded) return;
+  if (!loadPromise) {
+    loadPromise = (async () => {
+      try {
+        const raw = await fs.readFile(getStorageFilePath(), 'utf8');
+        const parsed = JSON.parse(raw) as Partial<PersistedAgentJournal>;
+        if (parsed.config) {
+          store.config = sanitizeConfig(parsed.config);
+        }
+        store.lastTradeAt =
+          typeof parsed.lastTradeAt === 'number' ? parsed.lastTradeAt : null;
+        store.lastProcessedCandles =
+          parsed.lastProcessedCandles &&
+          typeof parsed.lastProcessedCandles === 'object'
+            ? { ...parsed.lastProcessedCandles }
+            : {};
+        const now = Date.now();
+        store.cooldowns = {};
+        if (parsed.cooldowns && typeof parsed.cooldowns === 'object') {
+          for (const [sym, until] of Object.entries(parsed.cooldowns)) {
+            if (typeof until === 'number' && until > now) {
+              store.cooldowns[sym] = until;
+            }
+          }
+        }
+        store.trades = Array.isArray(parsed.trades)
+          ? parsed.trades.slice(-MAX_TRADES)
+          : [];
+        store.learningSamples = Array.isArray(parsed.learningSamples)
+          ? parsed.learningSamples.slice(-MAX_SAMPLES)
+          : [];
+        store.logs = Array.isArray(parsed.logs)
+          ? parsed.logs.slice(-MAX_LOGS)
+          : [];
+        store.criticalErrors = Array.isArray(parsed.criticalErrors)
+          ? parsed.criticalErrors.slice(-MAX_CRITICAL_ERRORS)
+          : [];
+        if (parsed.dailyEquity && parsed.dailyEquity.dateUtc === utcDateKey()) {
+          store.dailyEquity = {
+            dateUtc: parsed.dailyEquity.dateUtc,
+            startingEquity: Number(parsed.dailyEquity.startingEquity) || 0,
+            peakEquity: Number(parsed.dailyEquity.peakEquity) || 0,
+          };
+        }
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') {
+          console.error('[agentStorage] failed to load journal:', err);
+        }
+      }
+      loaded = true;
+    })();
+  }
+  await loadPromise;
+}
+
+export function sanitizeConfig(
+  partial: Partial<AgentEngineConfig>
+): AgentEngineConfig {
+  const clamp = (n: number, lo: number, hi: number) =>
+    Math.min(hi, Math.max(lo, Number.isFinite(n) ? n : lo));
+
+  return {
+    environment: 'USD_M_FUTURES_DEMO',
+    minSignalScore: clamp(
+      Number(partial.minSignalScore ?? DEFAULT_AGENT_CONFIG.minSignalScore),
+      50,
+      95
+    ),
+    riskPerTradePct: clamp(
+      Number(partial.riskPerTradePct ?? DEFAULT_AGENT_CONFIG.riskPerTradePct),
+      0.05,
+      DEFAULT_AGENT_CONFIG.riskPerTradePct
+    ),
+    maxLeverage: Math.trunc(
+      clamp(
+        Number(partial.maxLeverage ?? DEFAULT_AGENT_CONFIG.maxLeverage),
+        1,
+        DEFAULT_AGENT_CONFIG.maxLeverage
+      )
+    ),
+    maxOpenPositions: DEFAULT_AGENT_CONFIG.maxOpenPositions,
+    maxOrderNotionalUsd: clamp(
+      Number(
+        partial.maxOrderNotionalUsd ?? DEFAULT_AGENT_CONFIG.maxOrderNotionalUsd
+      ),
+      5,
+      DEFAULT_AGENT_CONFIG.maxOrderNotionalUsd
+    ),
+    maxDailyLossPct: clamp(
+      Number(partial.maxDailyLossPct ?? DEFAULT_AGENT_CONFIG.maxDailyLossPct),
+      0.25,
+      DEFAULT_AGENT_CONFIG.maxDailyLossPct
+    ),
+    cooldownMinutes: clamp(
+      Number(partial.cooldownMinutes ?? DEFAULT_AGENT_CONFIG.cooldownMinutes),
+      5,
+      240
+    ),
+    requireAiApproval: true, // AI approval remains required for automated Demo entries
+    localAiApprovalEnabled: partial.localAiApprovalEnabled === true,
+    tradingPolicy:
+      partial.tradingPolicy === 'QUANT_ONLY_PAPER' &&
+      partial.quantOnlyPaperMode === true
+        ? 'QUANT_ONLY_PAPER'
+        : 'AI_REQUIRED',
+    quantOnlyPaperMode:
+      partial.tradingPolicy === 'QUANT_ONLY_PAPER' ||
+      partial.quantOnlyPaperMode === true
+        ? Boolean(partial.quantOnlyPaperMode ?? (partial.tradingPolicy === 'QUANT_ONLY_PAPER'))
+        : false,
+  };
+}
+
+export function persistAgentStorage(): Promise<void> {
+  persistChain = persistChain
+    .then(async () => {
+      const target = getStorageFilePath();
+      const dir = path.dirname(target);
+      const tmp = `${target}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}.tmp`;
+      const payload: PersistedAgentJournal = {
+        version: 2,
+        config: store.config,
+        dailyEquity: store.dailyEquity,
+        lastTradeAt: store.lastTradeAt,
+        lastProcessedCandles: store.lastProcessedCandles,
+        cooldowns: store.cooldowns,
+        trades: store.trades.slice(-MAX_TRADES),
+        learningSamples: store.learningSamples.slice(-MAX_SAMPLES),
+        logs: store.logs.slice(-MAX_LOGS),
+        criticalErrors: store.criticalErrors.slice(-MAX_CRITICAL_ERRORS),
+      };
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(tmp, JSON.stringify(payload, null, 2), 'utf8');
+      await fs.rename(tmp, target);
+    })
+    .catch((err) => {
+      console.error('[agentStorage] persist failed:', err);
+    });
+  return persistChain;
+}
+
+export function getAgentConfig(): AgentEngineConfig {
+  return { ...store.config };
+}
+
+export async function updateAgentConfig(
+  partial: Partial<AgentEngineConfig>
+): Promise<AgentEngineConfig> {
+  await ensureAgentStorageLoaded();
+  store.config = sanitizeConfig({ ...store.config, ...partial });
+  await persistAgentStorage();
+  return { ...store.config };
+}
+
+export function appendAgentLog(
+  agent: AgentLogEntry['agent'],
+  level: AgentLogEntry['level'],
+  message: string,
+  symbol?: string
+): AgentLogEntry {
+  const entry: AgentLogEntry = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    at: Date.now(),
+    agent,
+    level,
+    message,
+    ...(symbol ? { symbol } : {}),
+  };
+  store.logs.push(entry);
+  if (store.logs.length > MAX_LOGS) {
+    store.logs = store.logs.slice(-MAX_LOGS);
+  }
+  void persistAgentStorage();
+  return entry;
+}
+
+export function recordCriticalError(
+  stage: string,
+  message: string,
+  symbol?: string
+): AgentCriticalError {
+  const err: AgentCriticalError = {
+    id: `crit-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    at: Date.now(),
+    ...(symbol ? { symbol } : {}),
+    stage,
+    message,
+    resolved: false,
+  };
+  store.criticalErrors.push(err);
+  if (store.criticalErrors.length > MAX_CRITICAL_ERRORS) {
+    store.criticalErrors = store.criticalErrors.slice(-MAX_CRITICAL_ERRORS);
+  }
+  appendAgentLog('AGENT_5_EXECUTION', 'CRITICAL', `[${stage}] ${message}`, symbol);
+  void persistAgentStorage();
+  return err;
+}
+
+export function getCriticalErrors(limit = 50): AgentCriticalError[] {
+  return store.criticalErrors
+    .slice()
+    .sort((a, b) => b.at - a.at)
+    .slice(0, limit);
+}
+
+export function syncDailyEquity(currentEquity: number): DailyEquityState {
+  const today = utcDateKey();
+  if (store.dailyEquity.dateUtc !== today) {
+    store.dailyEquity = {
+      dateUtc: today,
+      startingEquity: currentEquity > 0 ? currentEquity : 0,
+      peakEquity: currentEquity > 0 ? currentEquity : 0,
+    };
+    void persistAgentStorage();
+  } else if (currentEquity > 0) {
+    if (store.dailyEquity.startingEquity <= 0) {
+      store.dailyEquity.startingEquity = currentEquity;
+      store.dailyEquity.peakEquity = currentEquity;
+      void persistAgentStorage();
+    } else if (currentEquity > store.dailyEquity.peakEquity) {
+      store.dailyEquity.peakEquity = currentEquity;
+      void persistAgentStorage();
+    }
+  }
+  return { ...store.dailyEquity };
+}
+
+export function getDailyEquityState(): DailyEquityState {
+  const today = utcDateKey();
+  if (store.dailyEquity.dateUtc !== today) {
+    return { dateUtc: today, startingEquity: 0, peakEquity: 0 };
+  }
+  return { ...store.dailyEquity };
+}
+
+export function getSymbolCooldown(symbol: string): number | null {
+  const until = store.cooldowns[symbol];
+  if (!until) return null;
+  if (Date.now() >= until) {
+    delete store.cooldowns[symbol];
+    return null;
+  }
+  return until;
+}
+
+export async function startSymbolCooldown(
+  symbol: string,
+  minutes = store.config.cooldownMinutes
+): Promise<number> {
+  await ensureAgentStorageLoaded();
+  const until = Date.now() + Math.max(1, minutes) * 60_000;
+  store.cooldowns[symbol] = until;
+  await persistAgentStorage();
+  return until;
+}
+
+export function getLastProcessedCandle(symbol: string): number | null {
+  return store.lastProcessedCandles[symbol] ?? null;
+}
+
+export function setLastProcessedCandle(symbol: string, closeTimeMs: number): void {
+  store.lastProcessedCandles[symbol] = closeTimeMs;
+}
+
+export function hasClientOrderId(clientOrderId: string): boolean {
+  return store.trades.some(
+    (t) =>
+      t.entryClientOrderId === clientOrderId ||
+      t.stopClientAlgoId === clientOrderId ||
+      t.targetClientAlgoId === clientOrderId
+  );
+}
+
+export function getLastTradeAt(): number | null {
+  return store.lastTradeAt;
+}
+
+export async function recordTradeOpened(trade: AgentTradeRecord): Promise<void> {
+  await ensureAgentStorageLoaded();
+  // A retry for the same execution must not create a second journal row.
+  if (store.trades.some((existing) => existing.id === trade.id)) return;
+  store.lastTradeAt = trade.openedAt;
+  store.trades.push(trade);
+  if (store.trades.length > MAX_TRADES) {
+    store.trades = store.trades.slice(-MAX_TRADES);
+  }
+  await persistAgentStorage();
+}
+
+export function getActiveTradeRecord(): AgentTradeRecord | null {
+  // Uncertain emergency closures remain recoverable until exchange state is checked.
+  const recoverable = store.trades.filter(
+    (t) => t.status === 'OPEN' || t.executionStatus === 'UNCERTAIN_RECOVERY_NEEDED'
+  );
+  return recoverable.length > 0 ? recoverable[recoverable.length - 1] : null;
+}
+
+export function getRecentTrades(limit = 50): AgentTradeRecord[] {
+  return store.trades
+    .slice()
+    .sort((a, b) => b.openedAt - a.openedAt)
+    .slice(0, limit);
+}
+
+export function getRecentLogs(limit = 150): AgentLogEntry[] {
+  return store.logs
+    .slice()
+    .sort((a, b) => b.at - a.at)
+    .slice(0, limit);
+}
+
+function isEligibleLearningSample(sample: LearningSample): boolean {
+  if (!sample || sample.financialsVerified !== true) return false;
+  if (typeof sample.tradeId !== 'string' || !sample.tradeId.trim()) return false;
+  if (typeof sample.symbol !== 'string' || !sample.symbol.trim()) return false;
+  if (sample.side !== 'BUY' && sample.side !== 'SELL') return false;
+  if (!Number.isFinite(sample.netPnl) || !Number.isFinite(sample.returnPct)) return false;
+  if (!Number.isFinite(sample.holdingMs) || sample.holdingMs < 0) return false;
+  if (!Number.isFinite(sample.recordedAt) || sample.recordedAt <= 0) return false;
+  if (!sample.features || typeof sample.features !== 'object') return false;
+
+  const expectedOutcome: LearningSample['outcome'] =
+    sample.netPnl > 1e-6 ? 'WIN' : sample.netPnl < -1e-6 ? 'LOSS' : 'FLAT';
+  return sample.outcome === expectedOutcome;
+}
+
+export function getLearningSamples(limit = 200): LearningSample[] {
+  // Keep the latest verified sample per trade; legacy samples without the
+  // explicit marker remain in the journal but are never used for learning.
+  const unique = new Map<string, LearningSample>();
+  for (const sample of store.learningSamples) {
+    if (isEligibleLearningSample(sample)) unique.set(sample.tradeId, sample);
+  }
+  const ordered = Array.from(unique.values()).sort(
+    (a, b) => a.recordedAt - b.recordedAt
+  );
+  const safeLimit = Math.max(0, Math.trunc(Number.isFinite(limit) ? limit : 200));
+  return safeLimit === 0 ? [] : ordered.slice(-safeLimit);
+}
+
+export async function updateOpenTradeMetrics(
+  tradeId: string,
+  updates: Partial<
+    Pick<
+      AgentTradeRecord,
+      | 'markPrice'
+      | 'unrealizedPnl'
+      | 'executedQuantity'
+      | 'entryPrice'
+      | 'stopAlgoId'
+      | 'targetAlgoId'
+      | 'stopStatus'
+      | 'takeProfitStatus'
+      | 'executionStatus'
+      | 'fundingFees'
+    >
+  >
+): Promise<void> {
+  await ensureAgentStorageLoaded();
+  const trade = store.trades.find((t) => t.id === tradeId);
+  if (!trade) return;
+  Object.assign(trade, updates);
+  await persistAgentStorage();
+}
+
+export async function recordTradeClosed(
+  tradeId: string,
+  params: {
+    status: 'CLOSED' | 'EMERGENCY_CLOSED';
+    exitPrice: number | null;
+    realizedPnl: number;
+    tradingFees: number;
+    fundingFees?: number;
+    closeReason: string;
+    executionStatus?: ExecutionLifecycleStatus;
+    financialsVerified?: boolean;
+  }
+): Promise<AgentTradeRecord | null> {
+  await ensureAgentStorageLoaded();
+  const trade = store.trades.find((t) => t.id === tradeId);
+  if (!trade) return null;
+
+  // Finalized records cannot be closed twice. An uncertain rollback stays retryable.
+  if (trade.closedAt !== null && trade.executionStatus !== 'UNCERTAIN_RECOVERY_NEEDED') {
+    return trade;
+  }
+
+  const executionStatus = params.executionStatus ?? 'CLOSED';
+  const tradingFees = Math.abs(params.tradingFees);
+  const fundingFees = params.fundingFees ?? trade.fundingFees ?? 0;
+  const financiallyVerified =
+    params.financialsVerified === true &&
+    params.status === 'CLOSED' &&
+    executionStatus === 'CLOSED' &&
+    Number.isFinite(params.realizedPnl) &&
+    Number.isFinite(tradingFees) &&
+    Number.isFinite(fundingFees) &&
+    typeof params.exitPrice === 'number' &&
+    Number.isFinite(params.exitPrice) &&
+    params.exitPrice > 0 &&
+    Number.isFinite(trade.notionalUsd) &&
+    trade.notionalUsd > 0;
+  const wasEmergency =
+    trade.status === 'EMERGENCY_CLOSED' ||
+    trade.executionStatus === 'ROLLBACK_CLOSED' ||
+    /ROLLBACK|CRITICAL_OPEN_EXPOSURE/i.test(trade.closeReason ?? '');
+  const closedAt = Date.now();
+
+  trade.status = params.status;
+  trade.executionStatus = executionStatus;
+  trade.exitPrice = params.exitPrice;
+  trade.financialsVerified = financiallyVerified;
+  trade.unrealizedPnl = 0;
+  trade.closedAt = closedAt;
+  trade.closeReason = params.closeReason;
+
+  if (financiallyVerified) {
+    trade.realizedPnl = params.realizedPnl;
+    trade.tradingFees = tradingFees;
+    trade.fundingFees = fundingFees;
+    trade.commission = tradingFees;
+    trade.netPnl = params.realizedPnl - tradingFees + fundingFees;
+  } else {
+    // Zero values supplied by rollback/fallback code are placeholders, not PnL.
+    trade.realizedPnl = null;
+    trade.netPnl = null;
+  }
+
+  // Emergency rollback trades are retained for audit/recovery, never used as
+  // strategy-learning examples, even when their final exchange PnL is recovered.
+  if (financiallyVerified && !wasEmergency) {
+    const netPnl = trade.netPnl as number;
+    const outcome: LearningSample['outcome'] =
+      netPnl > 1e-6 ? 'WIN' : netPnl < -1e-6 ? 'LOSS' : 'FLAT';
+    const returnPct = (netPnl / trade.notionalUsd) * 100;
+    const sample: LearningSample = {
+      id: `sample-${trade.id}`,
+      tradeId: trade.id,
+      symbol: trade.symbol,
+      side: trade.side,
+      outcome,
+      netPnl,
+      returnPct,
+      holdingMs: Math.max(0, closedAt - trade.openedAt),
+      recordedAt: closedAt,
+      financialsVerified: true,
+      features: trade.signalSnapshot,
+    };
+    const existingIndex = store.learningSamples.findIndex(
+      (item) => item.tradeId === trade.id || item.id === sample.id
+    );
+    if (existingIndex >= 0) store.learningSamples[existingIndex] = sample;
+    else store.learningSamples.push(sample);
+  }
+
+  if (store.learningSamples.length > MAX_SAMPLES) {
+    store.learningSamples = store.learningSamples.slice(-MAX_SAMPLES);
+  }
+
+  await persistAgentStorage();
+  return trade;
+}
+
+export function getTodayRealizedPnl(): number {
+  const today = utcDateKey();
+  return store.trades
+    .filter(
+      (t) =>
+        t.status !== 'OPEN' &&
+        t.closedAt &&
+        utcDateKey(t.closedAt) === today &&
+        t.netPnl !== null
+    )
+    .reduce((sum, t) => sum + (t.netPnl ?? 0), 0);
+}
+
+export function buildWalkForwardReport(
+  samples: LearningSample[]
+): WalkForwardReport {
+  const ordered = samples
+    .slice()
+    .sort((a, b) => a.recordedAt - b.recordedAt);
+
+  if (ordered.length < MIN_WALK_FORWARD_SAMPLES) {
+    return {
+      status: 'INSUFFICIENT_SAMPLES',
+      minimumSamplesRequired: MIN_WALK_FORWARD_SAMPLES,
+      availableSamples: ordered.length,
+      retrainPolicy: 'PERIODIC_OFFLINE_ONLY',
+      dynamicRiskMutation: false,
+      folds: [],
+      summaryNote: `Collected ${ordered.length}/${MIN_WALK_FORWARD_SAMPLES} closed trade samples required for chronological walk-forward folds. Live risk limits remain locked.`,
+    };
+  }
+
+  const folds: WalkForwardFold[] = [];
+  const foldCount = Math.min(3, Math.floor(ordered.length / 3));
+  const testSize = Math.max(2, Math.floor(ordered.length / (foldCount + 1)));
+
+  for (let i = 0; i < foldCount; i++) {
+    const trainEnd = ordered.length - (foldCount - i) * testSize;
+    const testEnd = trainEnd + testSize;
+    if (trainEnd < 2) continue;
+
+    const trainSlice = ordered.slice(0, trainEnd);
+    const testSlice = ordered.slice(trainEnd, testEnd);
+    if (testSlice.length === 0) continue;
+
+    const trainWins = trainSlice.filter((s) => s.outcome === 'WIN').length;
+    const testWins = testSlice.filter((s) => s.outcome === 'WIN').length;
+    const testGrossWin = testSlice
+      .filter((s) => s.netPnl > 0)
+      .reduce((acc, s) => acc + s.netPnl, 0);
+    const testGrossLoss = Math.abs(
+      testSlice
+        .filter((s) => s.netPnl < 0)
+        .reduce((acc, s) => acc + s.netPnl, 0)
+    );
+    const testNetPnl = testSlice.reduce((acc, s) => acc + s.netPnl, 0);
+
+    folds.push({
+      fold: folds.length + 1,
+      trainCount: trainSlice.length,
+      testCount: testSlice.length,
+      trainWinRate: Number(((trainWins / trainSlice.length) * 100).toFixed(1)),
+      testWinRate: Number(((testWins / testSlice.length) * 100).toFixed(1)),
+      testNetPnl: Number(testNetPnl.toFixed(4)),
+      testProfitFactor:
+        testGrossLoss > 0
+          ? Number((testGrossWin / testGrossLoss).toFixed(2))
+          : testGrossWin > 0
+            ? 99
+            : null,
+    });
+  }
+
+  return {
+    status: 'READY',
+    minimumSamplesRequired: MIN_WALK_FORWARD_SAMPLES,
+    availableSamples: ordered.length,
+    retrainPolicy: 'PERIODIC_OFFLINE_ONLY',
+    dynamicRiskMutation: false,
+    folds,
+    summaryNote: `Prepared ${folds.length} chronological walk-forward fold(s) across ${ordered.length} closed trades for periodic evaluation. Live risk limits cannot be auto-escalated.`,
+  };
+}
+
+export function getPerformanceSummary(currentEquity = 0): PerformanceSummary {
+  const closed = store.trades
+    .filter((t) => t.status !== 'OPEN' && t.netPnl !== null)
+    .slice()
+    .sort((a, b) => (a.closedAt ?? a.openedAt) - (b.closedAt ?? b.openedAt));
+
+  const openTrades = store.trades.filter((t) => t.status === 'OPEN').length;
+  const wins = closed.filter((t) => (t.netPnl ?? 0) > 0).length;
+  const losses = closed.filter((t) => (t.netPnl ?? 0) < 0).length;
+  const grossProfit = closed
+    .filter((t) => (t.netPnl ?? 0) > 0)
+    .reduce((sum, t) => sum + (t.netPnl ?? 0), 0);
+  const grossLoss = Math.abs(
+    closed
+      .filter((t) => (t.netPnl ?? 0) < 0)
+      .reduce((sum, t) => sum + (t.netPnl ?? 0), 0)
+  );
+  const totalRealizedPnl = closed.reduce(
+    (sum, t) => sum + (t.realizedPnl ?? 0),
+    0
+  );
+  const totalTradingFees = closed.reduce(
+    (sum, t) => sum + (t.tradingFees ?? t.commission ?? 0),
+    0
+  );
+  const totalFundingFees = closed.reduce(
+    (sum, t) => sum + (t.fundingFees ?? 0),
+    0
+  );
+  const netRealizedPnl = closed.reduce((sum, t) => sum + (t.netPnl ?? 0), 0);
+
+  let cumulative = 0;
+  let peak = 0;
+  let maxDrawdownUsd = 0;
+  const equityCurve: PerformanceSummary['equityCurve'] = [];
+
+  for (const t of closed) {
+    cumulative += t.netPnl ?? 0;
+    if (cumulative > peak) peak = cumulative;
+    const dd = peak - cumulative;
+    if (dd > maxDrawdownUsd) maxDrawdownUsd = dd;
+    equityCurve.push({
+      time: t.closedAt ?? t.openedAt,
+      cumulativePnl: Number(cumulative.toFixed(4)),
+      drawdownUsd: Number(dd.toFixed(4)),
+    });
+  }
+
+  const daily = getDailyEquityState();
+  const baseEquity =
+    daily.startingEquity > 0 ? daily.startingEquity : currentEquity;
+  const maxDrawdownPct =
+    baseEquity > 0 ? (maxDrawdownUsd / baseEquity) * 100 : 0;
+  const todayRealizedPnl = getTodayRealizedPnl();
+  const dailyDrawdownPct =
+    daily.startingEquity > 0 && currentEquity > 0
+      ? Math.max(
+          0,
+          ((daily.startingEquity - currentEquity) / daily.startingEquity) * 100
+        )
+      : 0;
+
+  return {
+    totalTrades: store.trades.length,
+    openTrades,
+    closedTrades: closed.length,
+    wins,
+    losses,
+    winRate:
+      closed.length > 0
+        ? Number(((wins / closed.length) * 100).toFixed(1))
+        : null,
+    lossRate:
+      closed.length > 0
+        ? Number(((losses / closed.length) * 100).toFixed(1))
+        : null,
+    grossProfit: Number(grossProfit.toFixed(4)),
+    grossLoss: Number(grossLoss.toFixed(4)),
+    profitFactor:
+      grossLoss > 0
+        ? Number((grossProfit / grossLoss).toFixed(2))
+        : grossProfit > 0
+          ? 99
+          : null,
+    expectancyUsd:
+      closed.length > 0
+        ? Number((netRealizedPnl / closed.length).toFixed(4))
+        : null,
+    totalRealizedPnl: Number(totalRealizedPnl.toFixed(4)),
+    totalTradingFees: Number(totalTradingFees.toFixed(4)),
+    totalFundingFees: Number(totalFundingFees.toFixed(4)),
+    totalFees: Number(totalTradingFees.toFixed(4)),
+    netRealizedPnl: Number(netRealizedPnl.toFixed(4)),
+    todayRealizedPnl: Number(todayRealizedPnl.toFixed(4)),
+    dailyStartingEquity: Number(daily.startingEquity.toFixed(2)),
+    dailyDrawdownPct: Number(dailyDrawdownPct.toFixed(2)),
+    maxDrawdownUsd: Number(maxDrawdownUsd.toFixed(4)),
+    maxDrawdownPct: Number(maxDrawdownPct.toFixed(2)),
+    learningSampleCount: getLearningSamples(MAX_SAMPLES).length,
+    equityCurve,
+    walkForwardReport: buildWalkForwardReport(getLearningSamples(MAX_SAMPLES)),
+  };
+}
+
+// â”€â”€ Non-blocking Server-Side Telegram Notifier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+export type TelegramEventType =
+  | 'SIGNAL_APPROVED'
+  | 'RISK_REJECTED'
+  | 'DEMO_ORDER_EXECUTED'
+  | 'SL_CONFIRMED'
+  | 'TP_CONFIRMED'
+  | 'POSITION_CLOSED'
+  | 'DAILY_LOSS_LIMIT'
+  | 'CRITICAL_FAILURE';
+
+const TELEGRAM_DEDUPE_MS = 60_000;
+const recentTelegramKeys = new Map<string, number>();
+
+export async function notifyTelegramEvent(
+  eventType: TelegramEventType,
+  text: string,
+  dedupeKey?: string
+): Promise<boolean> {
+  const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+  if (!token || !chatId) return false;
+
+  if (dedupeKey) {
+    const prev = recentTelegramKeys.get(dedupeKey);
+    if (prev && Date.now() - prev < TELEGRAM_DEDUPE_MS) {
+      return false;
+    }
+    recentTelegramKeys.set(dedupeKey, Date.now());
+  }
+
+  try {
+    const safeText = `[TURBOSCALP DEMO Â· ${eventType}]\n${text}`.slice(0, 3800);
+    await axios.post(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        chat_id: chatId,
+        text: safeText,
+        disable_web_page_preview: true,
+      },
+      { timeout: 5_000 }
+    );
+    return true;
+  } catch (err: any) {
+    // Non-blocking: Telegram failures must never interfere with exchange risk protection.
+    console.warn('[telegram] notification skipped:', err?.message || 'error');
+    return false;
+  }
+}
+===== tradeMonitor.ts =====
+// server/agent/tradeMonitor.ts
+// Agent 6 â€“ Trade Monitoring & Learning Agent
+// Monitors exchange positions, regular open orders, open Algo Orders,
+// mark price, unrealized & realized PnL, trading fees, and funding fees.
+// Preserves protective exits even when new entries are paused or stopped.
+// Starts symbol cooldown on closure and saves completed trade + learning records.
+
+import {
+  appendAgentLog,
+  getActiveTradeRecord,
+  notifyTelegramEvent,
+  recordCriticalError,
+  recordTradeClosed,
+  startSymbolCooldown,
+  syncDailyEquity,
+  updateOpenTradeMetrics,
+  type AgentTradeRecord,
+} from './agentStorage.js';
+import {
+  cancelAlgoOrderSafe,
+  fetchOpenAlgoOrdersSafe,
+  type BinanceRequestFn,
+  type DemoCredentials,
+} from './executionManager.js';
+import type { AccountSnapshotInput } from './riskManager.js';
+
+export interface ExchangePositionSnapshot {
+  symbol: string;
+  positionSide: string;
+  positionAmt: number;
+  entryPrice: number;
+  markPrice: number;
+  unRealizedProfit: number;
+  leverage: number;
+}
+
+export interface ExchangeStateSnapshot {
+  account: AccountSnapshotInput;
+  positions: ExchangePositionSnapshot[];
+  openOrders: any[];
+  algoOrders: any[];
+  openOrdersCount: number;
+}
+
+const toNum = (v: unknown): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+export async function readExchangeSnapshot(
+  binanceRequest: BinanceRequestFn,
+  credentials: DemoCredentials | null
+): Promise<ExchangeStateSnapshot> {
+  if (!credentials?.apiKey || !credentials?.apiSecret) {
+    return {
+      account: {
+        connected: false,
+        canTrade: false,
+        availableBalance: 0,
+        totalWalletBalance: 0,
+        totalUnrealizedProfit: 0,
+      },
+      positions: [],
+      openOrders: [],
+      algoOrders: [],
+      openOrdersCount: 0,
+    };
+  }
+
+  const [acct, accountConfigSettled, posRisk, openOrders, algoOrders] =
+    await Promise.all([
+      binanceRequest<any>('GET', '/fapi/v3/account', {}, true, credentials),
+      binanceRequest<any>(
+        'GET',
+        '/fapi/v1/accountConfig',
+        {},
+        true,
+        credentials
+      ).catch(() => null),
+      binanceRequest<any[]>(
+        'GET',
+        '/fapi/v3/positionRisk',
+        {},
+        true,
+        credentials
+      ),
+      binanceRequest<any[]>('GET', '/fapi/v1/openOrders', {}, true, credentials),
+      fetchOpenAlgoOrdersSafe(binanceRequest, credentials),
+    ]);
+
+  const usdtAsset = Array.isArray(acct?.assets)
+    ? acct.assets.find((a: any) => a.asset === 'USDT')
+    : undefined;
+
+  const totalWalletBalance = toNum(
+    usdtAsset?.walletBalance ?? acct?.totalWalletBalance
+  );
+  const availableBalance = toNum(
+    usdtAsset?.availableBalance ?? acct?.availableBalance
+  );
+  const totalUnrealizedProfit = toNum(acct?.totalUnrealizedProfit);
+
+  if (totalWalletBalance > 0) {
+    syncDailyEquity(totalWalletBalance);
+  }
+
+  const positions: ExchangePositionSnapshot[] = (
+    Array.isArray(posRisk) ? posRisk : []
+  )
+    .map((p: any) => ({
+      symbol: String(p.symbol || ''),
+      positionSide: String(p.positionSide || 'BOTH'),
+      positionAmt: toNum(p.positionAmt),
+      entryPrice: toNum(p.entryPrice),
+      markPrice: toNum(p.markPrice),
+      unRealizedProfit: toNum(p.unRealizedProfit),
+      leverage: toNum(p.leverage) || 1,
+    }))
+    .filter((p) => Math.abs(p.positionAmt) > 1e-12);
+
+  const regList = Array.isArray(openOrders) ? openOrders : [];
+  const algoList = Array.isArray(algoOrders) ? algoOrders : [];
+
+  // Authoritative trading permission comes strictly from GET /fapi/v1/accountConfig.
+  const canTrade = accountConfigSettled?.canTrade === true;
+
+  return {
+    account: {
+      connected: true,
+      canTrade,
+      availableBalance,
+      totalWalletBalance,
+      totalUnrealizedProfit,
+    },
+    positions,
+    openOrders: regList,
+    algoOrders: algoList,
+    openOrdersCount: regList.length + algoList.length,
+  };
+}
+
+export async function reconcilePositionAndOrders(
+  binanceRequest: BinanceRequestFn,
+  credentials: DemoCredentials | null,
+  cooldownMinutes: number
+): Promise<{
+  snapshot: ExchangeStateSnapshot;
+  activeTradeStillOpen: boolean;
+  reconcileNote: string;
+}> {
+  const snapshot = await readExchangeSnapshot(binanceRequest, credentials);
+  const active = getActiveTradeRecord();
+
+  if (!credentials?.apiKey || !credentials?.apiSecret) {
+    return {
+      snapshot,
+      activeTradeStillOpen: Boolean(active),
+      reconcileNote: active
+        ? `Awaiting Demo reconnect to reconcile ${active.symbol}`
+        : 'Monitoring idle (Demo API disconnected)',
+    };
+  }
+
+  if (!active) {
+    if (snapshot.positions.length > 0) {
+      const p = snapshot.positions[0];
+      return {
+        snapshot,
+        activeTradeStillOpen: true,
+        reconcileNote: `External open Demo position detected: ${p.symbol} (${p.positionAmt})`,
+      };
+    }
+    return {
+      snapshot,
+      activeTradeStillOpen: false,
+      reconcileNote: `Account reconciled Â· $0 uPnL Â· ${snapshot.openOrdersCount} open order(s)`,
+    };
+  }
+
+  // Reconcile the bot-tracked OPEN trade against real Binance Demo state
+  const livePos = snapshot.positions.find(
+    (p) =>
+      p.symbol === active.symbol &&
+      (active.positionMode === 'ONE_WAY' || p.positionSide === active.positionSide)
+  );
+
+  if (!livePos) {
+    // A flat position is not enough to establish a financial outcome. Require
+    // exchange income rows and actual fills before finalizing PnL or learning.
+    let realizedPnl = 0;
+    let tradingFees = 0;
+    let fundingFees = 0;
+    let exitPrice: number | null = active.markPrice;
+    let financialsVerified = false;
+    let reconciliationError = 'Exchange income/trade history was incomplete';
+
+    try {
+      const [incomes, userTrades] = await Promise.all([
+        binanceRequest<any[]>(
+          'GET',
+          '/fapi/v1/income',
+          { symbol: active.symbol, startTime: active.openedAt - 5_000, limit: 100 },
+          true,
+          credentials
+        ),
+        binanceRequest<any[]>(
+          'GET',
+          '/fapi/v1/userTrades',
+          { symbol: active.symbol, startTime: active.openedAt - 5_000, limit: 50 },
+          true,
+          credentials
+        ),
+      ]);
+
+      if (!Array.isArray(incomes) || !Array.isArray(userTrades)) {
+        throw new Error('Binance returned an invalid income or user-trades response');
+      }
+
+      const validIncomeRows = incomes.filter(
+        (row: any) =>
+          ['REALIZED_PNL', 'COMMISSION', 'FUNDING_FEE'].includes(row?.incomeType) &&
+          (typeof row.income === 'string' || typeof row.income === 'number') &&
+          Number.isFinite(Number(row.income))
+      );
+      const realizedRows = validIncomeRows.filter(
+        (row: any) => row.incomeType === 'REALIZED_PNL'
+      );
+      const commissionRows = validIncomeRows.filter(
+        (row: any) => row.incomeType === 'COMMISSION'
+      );
+      const validFills = userTrades.filter(
+        (row: any) =>
+          (typeof row?.price === 'string' || typeof row?.price === 'number') &&
+          Number.isFinite(Number(row.price)) &&
+          Number(row.price) > 0
+      );
+
+      if (realizedRows.length === 0 || commissionRows.length === 0 || validFills.length === 0) {
+        throw new Error('Binance history did not contain realized PnL, commission, and valid fill records');
+      }
+
+      realizedPnl = realizedRows.reduce(
+        (sum: number, row: any) => sum + Number(row.income),
+        0
+      );
+      tradingFees = commissionRows.reduce(
+        (sum: number, row: any) => sum + Math.abs(Number(row.income)),
+        0
+      );
+      fundingFees = validIncomeRows
+        .filter((row: any) => row.incomeType === 'FUNDING_FEE')
+        .reduce((sum: number, row: any) => sum + Number(row.income), 0);
+      const lastFill = validFills[validFills.length - 1];
+      exitPrice = Number(lastFill.price);
+      financialsVerified =
+        Number.isFinite(realizedPnl) &&
+        Number.isFinite(tradingFees) &&
+        Number.isFinite(fundingFees) &&
+        Number.isFinite(exitPrice) &&
+        (exitPrice as number) > 0;
+      if (!financialsVerified) {
+        throw new Error('Binance financial history contained non-finite values');
+      }
+    } catch (err: any) {
+      reconciliationError = err?.message || 'Unable to verify Binance financial history';
+    }
+
+    // Cancel any leftover bot-owned protective Algo orders cleanly
+    await cancelAlgoOrderSafe(
+      binanceRequest,
+      credentials,
+      active.symbol,
+      active.stopAlgoId,
+      active.stopClientAlgoId
+    );
+    await cancelAlgoOrderSafe(
+      binanceRequest,
+      credentials,
+      active.symbol,
+      active.targetAlgoId,
+      active.targetClientAlgoId
+    );
+
+    if (!financialsVerified) {
+      // Keep the journal item recoverable and block new entries until history is verified.
+      const alreadyPending = active.executionStatus === 'UNCERTAIN_RECOVERY_NEEDED';
+      await updateOpenTradeMetrics(active.id, {
+        executionStatus: 'UNCERTAIN_RECOVERY_NEEDED',
+      });
+      if (!alreadyPending) {
+        recordCriticalError(
+          'MONITOR_FINANCIAL_RECONCILIATION',
+          `${active.symbol} is flat on the exchange, but PnL/fees could not be verified: ${reconciliationError}`,
+          active.symbol
+        );
+        appendAgentLog(
+          'AGENT_6_MONITOR',
+          'WARN',
+          `${active.symbol} is exchange-flat, but financial reconciliation is pending. The journal remains unresolved and new entries must stay paused.`,
+          active.symbol
+        );
+      }
+      return {
+        snapshot,
+        activeTradeStillOpen: true,
+        reconcileNote: `${active.symbol} is flat on exchange; financial history is unverified. Recovery remains pending.`,
+      };
+    }
+
+    const closed = await recordTradeClosed(active.id, {
+      status: 'CLOSED',
+      exitPrice,
+      realizedPnl,
+      tradingFees,
+      fundingFees,
+      closeReason: 'EXCHANGE_FLAT_RECONCILED',
+      executionStatus: 'CLOSED',
+      financialsVerified: true,
+    });
+
+    await startSymbolCooldown(active.symbol, cooldownMinutes);
+
+    const netPnl = closed?.netPnl ?? realizedPnl - tradingFees + fundingFees;
+    appendAgentLog(
+      'AGENT_6_MONITOR',
+      'TRADE',
+      `${active.symbol} closed on exchange Â· realized=${realizedPnl.toFixed(4)} USDT Â· fees=${tradingFees.toFixed(4)} Â· funding=${fundingFees.toFixed(4)} Â· net=${netPnl.toFixed(4)} USDT Â· ${cooldownMinutes}m cooldown started`,
+      active.symbol
+    );
+
+    void notifyTelegramEvent(
+      'POSITION_CLOSED',
+      `${active.symbol} ${active.side} closed @ $${(exitPrice ?? active.entryPrice).toFixed(4)}\nNet PnL: ${netPnl >= 0 ? '+' : ''}${netPnl.toFixed(4)} USDT (Realized ${realizedPnl.toFixed(4)}, Fees ${tradingFees.toFixed(4)}, Funding ${fundingFees.toFixed(4)})`
+    );
+
+    return {
+      snapshot,
+      activeTradeStillOpen: false,
+      reconcileNote: `Closed ${active.symbol} reconciled (net ${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(2)})`,
+    };
+  }
+
+  // Still open: reconcile mark price, unrealized PnL, and protective Algo Order status
+  const matchingAlgos = snapshot.algoOrders.filter(
+    (o: any) => o.symbol === active.symbol
+  );
+  const slAlive = matchingAlgos.some(
+    (o: any) =>
+      o.clientAlgoId === active.stopClientAlgoId ||
+      (active.stopAlgoId && String(o.algoId) === String(active.stopAlgoId))
+  );
+  const tpAlive = matchingAlgos.some(
+    (o: any) =>
+      o.clientAlgoId === active.targetClientAlgoId ||
+      (active.targetAlgoId && String(o.algoId) === String(active.targetAlgoId))
+  );
+
+  // Also sample accrued funding fees while open
+  let accruedFunding = active.fundingFees ?? 0;
+  try {
+    const fundingRows = await binanceRequest<any[]>(
+      'GET',
+      '/fapi/v1/income',
+      {
+        symbol: active.symbol,
+        incomeType: 'FUNDING_FEE',
+        startTime: active.openedAt,
+        limit: 50,
+      },
+      true,
+      credentials
+    );
+    if (Array.isArray(fundingRows)) {
+      accruedFunding = fundingRows.reduce((s, r) => s + toNum(r.income), 0);
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  if (!slAlive) {
+    recordCriticalError(
+      'MONITOR_MISSING_SL',
+      `Protective STOP_MARKET Algo order missing for open ${active.symbol} position.`,
+      active.symbol
+    );
+  }
+
+  await updateOpenTradeMetrics(active.id, {
+    markPrice: livePos.markPrice,
+    entryPrice: livePos.entryPrice > 0 ? livePos.entryPrice : active.entryPrice,
+    executedQuantity: String(Math.abs(livePos.positionAmt)),
+    unrealizedPnl: livePos.unRealizedProfit,
+    fundingFees: accruedFunding,
+    stopStatus: slAlive ? 'ARMED' : 'FAILED',
+    takeProfitStatus: tpAlive ? 'ARMED' : 'FAILED',
+  });
+
+  return {
+    snapshot,
+    activeTradeStillOpen: true,
+    reconcileNote: `${active.symbol} OPEN Â· entry=$${livePos.entryPrice.toFixed(4)} mark=$${livePos.markPrice.toFixed(4)} uPnL=${livePos.unRealizedProfit >= 0 ? '+' : ''}$${livePos.unRealizedProfit.toFixed(2)}`,
+  };
+}
+
+export function markUncertainStartupTrades(active: AgentTradeRecord | null): void {
+  if (!active) return;
+  appendAgentLog(
+    'AGENT_6_MONITOR',
+    'WARN',
+    `Server restarted with OPEN trade ${active.symbol} (entry=${active.entryPrice}, SL Algo #${active.stopAlgoId}, TP Algo #${active.targetAlgoId}). Auto-trading remains DISABLED until explicit resumption; monitoring continues.`,
+    active.symbol
+  );
+}
+===== executionManager.ts =====
+// server/agent/executionManager.ts
+// Agent 5 â€“ Automated Execution Agent (Binance USD-M Futures DEMO ONLY)
+// Strict safeguards:
+//   - Never executes without Risk Manager approval
+//   - Unique clientOrderId; queries exchange order status before any retry
+//   - Derives actual executedQty and avgFillPrice from exchange fill response
+//   - Handles One-Way vs Hedge position modes cleanly
+//   - Uses POST /fapi/v1/algoOrder (CONDITIONAL STOP_MARKET / TAKE_PROFIT_MARKET)
+//     with triggerPrice, workingType=MARK_PRICE, closePosition=true (no quantity or reduceOnly)
+//   - Never uses deprecated /fapi/v1/order for conditional exits
+//   - Verifies both Algo orders on GET /fapi/v1/openAlgoOrders
+//   - Full emergency rollback: cancel surviving Algo, MARKET close remaining position,
+//     verify flat, pause automated entries, and emit CRITICAL alert + Telegram notification.
+
+import {
+  appendAgentLog,
+  hasClientOrderId,
+  notifyTelegramEvent,
+  recordCriticalError,
+  recordTradeClosed,
+  recordTradeOpened,
+  type AgentTradeRecord,
+} from './agentStorage.js';
+import type { GeminiAnalysisResult } from './geminiAnalyst.js';
+import type { QuantAnalysisResult } from './quantAnalyst.js';
+import {
+  floorToStep,
+  roundPriceToTick,
+  type ApprovedOrderPlan,
+  type ExchangeSymbolFilter,
+  type RiskDecision,
+} from './riskManager.js';
+
+export type HttpMethod = 'GET' | 'POST' | 'DELETE';
+export type DemoCredentials = { apiKey: string; apiSecret: string };
+
+export type BinanceRequestFn = <T = any>(
+  method: HttpMethod,
+  endpoint: string,
+  params?: Record<string, any>,
+  signed?: boolean,
+  credentials?: DemoCredentials
+) => Promise<T>;
+
+export interface ExecutionContext {
+  credentials: DemoCredentials;
+  binanceRequest: BinanceRequestFn;
+  inFlightSymbols: Set<string>;
+  onPauseRequired: (reason: string) => void;
+}
+
+export interface ExecutionOutcome {
+  success: boolean;
+  tradeRecord: AgentTradeRecord | null;
+  error?: string;
+}
+
+const toNum = (v: unknown): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+export function extractFillMetrics(
+  orderResp: any,
+  fallbackPrice: number
+): {
+  orderId: number | string | null;
+  status: string;
+  executedQty: number;
+  avgPrice: number;
+} {
+  const executedQty = toNum(orderResp?.executedQty);
+  const directAvg = toNum(orderResp?.avgPrice);
+  const cumQuote = toNum(orderResp?.cumQuote ?? orderResp?.cumQuoteQty);
+  const derivedAvg =
+    directAvg > 0
+      ? directAvg
+      : executedQty > 0 && cumQuote > 0
+        ? cumQuote / executedQty
+        : fallbackPrice;
+
+  return {
+    orderId: orderResp?.orderId ?? null,
+    status: String(orderResp?.status || 'UNKNOWN'),
+    executedQty,
+    avgPrice: derivedAvg,
+  };
+}
+
+export function buildProtectiveAlgoParams(params: {
+  symbol: string;
+  entrySide: 'BUY' | 'SELL';
+  positionMode: 'ONE_WAY' | 'HEDGE';
+  positionSide: 'BOTH' | 'LONG' | 'SHORT';
+  type: 'STOP_MARKET' | 'TAKE_PROFIT_MARKET';
+  triggerPrice: string;
+  clientAlgoId: string;
+}): Record<string, string> {
+  const closeSide = params.entrySide === 'BUY' ? 'SELL' : 'BUY';
+  // Binance rule: with closePosition=true, do NOT send quantity or reduceOnly.
+  // Use triggerPrice (not deprecated stopPrice) and workingType=MARK_PRICE.
+  return {
+    algoType: 'CONDITIONAL',
+    symbol: params.symbol,
+    side: closeSide,
+    positionSide: params.positionMode === 'HEDGE' ? params.positionSide : 'BOTH',
+    type: params.type,
+    triggerPrice: params.triggerPrice,
+    workingType: 'MARK_PRICE',
+    closePosition: 'true',
+    clientAlgoId: params.clientAlgoId,
+  };
+}
+
+export async function fetchOpenAlgoOrdersSafe(
+  binanceRequest: BinanceRequestFn,
+  credentials: DemoCredentials,
+  symbol?: string
+): Promise<any[]> {
+  const query = symbol ? { symbol } : {};
+  try {
+    const resp = await binanceRequest<any[]>(
+      'GET',
+      '/fapi/v1/openAlgoOrders',
+      query,
+      true,
+      credentials
+    );
+    return Array.isArray(resp) ? resp : [];
+  } catch {
+    const resp = await binanceRequest<any[]>(
+      'GET',
+      '/fapi/v1/algoOpenOrders',
+      query,
+      true,
+      credentials
+    );
+    return Array.isArray(resp) ? resp : [];
+  }
+}
+
+export async function cancelAlgoOrderSafe(
+  binanceRequest: BinanceRequestFn,
+  credentials: DemoCredentials,
+  symbol: string,
+  algoId?: number | string | null,
+  clientAlgoId?: string
+): Promise<boolean> {
+  if (!algoId && !clientAlgoId) return false;
+  try {
+    const params: Record<string, any> = { symbol };
+    if (algoId) params.algoId = algoId;
+    else if (clientAlgoId) params.clientAlgoId = clientAlgoId;
+    await binanceRequest('DELETE', '/fapi/v1/algoOrder', params, true, credentials);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function detectPositionMode(
+  binanceRequest: BinanceRequestFn,
+  credentials: DemoCredentials
+): Promise<'ONE_WAY' | 'HEDGE'> {
+  try {
+    const dual = await binanceRequest<any>(
+      'GET',
+      '/fapi/v1/positionSide/dual',
+      {},
+      true,
+      credentials
+    );
+    return dual?.dualSidePosition === true ? 'HEDGE' : 'ONE_WAY';
+  } catch {
+    return 'ONE_WAY';
+  }
+}
+
+export async function executeApprovedOrder(
+  decision: RiskDecision,
+  quant: QuantAnalysisResult,
+  aiResult: GeminiAnalysisResult,
+  filter: ExchangeSymbolFilter,
+  ctx: ExecutionContext
+): Promise<ExecutionOutcome> {
+  const plan = decision.orderPlan;
+  if (!decision.approved || !plan) {
+    return {
+      success: false,
+      tradeRecord: null,
+      error: 'Execution rejected: missing Risk Manager approval.',
+    };
+  }
+
+  if (
+    ctx.inFlightSymbols.has(plan.symbol) ||
+    hasClientOrderId(plan.clientOrderId)
+  ) {
+    return {
+      success: false,
+      tradeRecord: null,
+      error: `Duplicate execution blocked for ${plan.symbol} (${plan.clientOrderId}).`,
+    };
+  }
+
+  ctx.inFlightSymbols.add(plan.symbol);
+  const tradeId = `tr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const stopClientAlgoId = `SL_${tradeId.slice(3, 15)}`;
+  const targetClientAlgoId = `TP_${tradeId.slice(3, 15)}`;
+
+  try {
+    const positionMode = await detectPositionMode(
+      ctx.binanceRequest,
+      ctx.credentials
+    );
+    const positionSide: 'BOTH' | 'LONG' | 'SHORT' =
+      positionMode === 'HEDGE'
+        ? plan.side === 'BUY'
+          ? 'LONG'
+          : 'SHORT'
+        : 'BOTH';
+
+    // Enforce leverage <= 2x on Binance Demo before entry
+    await ctx.binanceRequest(
+      'POST',
+      '/fapi/v1/leverage',
+      { symbol: plan.symbol, leverage: plan.leverage },
+      true,
+      ctx.credentials
+    );
+
+    const entryParams: Record<string, any> = {
+      symbol: plan.symbol,
+      side: plan.side,
+      type: 'MARKET',
+      quantity: plan.quantity,
+      newClientOrderId: plan.clientOrderId,
+      newOrderRespType: 'RESULT',
+    };
+    if (positionMode === 'HEDGE') {
+      entryParams.positionSide = positionSide;
+    }
+
+    let entryResp: any;
+    try {
+      entryResp = await ctx.binanceRequest<any>(
+        'POST',
+        '/fapi/v1/order',
+        entryParams,
+        true,
+        ctx.credentials
+      );
+    } catch (submitErr: any) {
+      // Do not blindly retry an ambiguous market order: check clientOrderId status on Binance first
+      try {
+        entryResp = await ctx.binanceRequest<any>(
+          'GET',
+          '/fapi/v1/order',
+          { symbol: plan.symbol, origClientOrderId: plan.clientOrderId },
+          true,
+          ctx.credentials
+        );
+        appendAgentLog(
+          'AGENT_5_EXECUTION',
+          'WARN',
+          `Recovered ambiguous entry order ${plan.clientOrderId} via exchange query.`,
+          plan.symbol
+        );
+      } catch {
+        throw submitErr;
+      }
+    }
+
+    const fill = extractFillMetrics(entryResp, plan.entryPrice);
+    if (fill.executedQty <= 0) {
+      throw new Error(
+        `Entry order ${plan.clientOrderId} returned executedQty=0 (status=${fill.status}).`
+      );
+    }
+
+    const actualQtyStr = floorToStep(fill.executedQty, filter.stepSize);
+    const actualNumericQty = Number(actualQtyStr) || fill.executedQty;
+    const isPartial =
+      Math.abs(actualNumericQty - plan.numericQuantity) > filter.stepSize * 0.5;
+    const actualNotional = Number((actualNumericQty * fill.avgPrice).toFixed(4));
+
+    // Recalculate protective trigger prices relative to actual fill price while preserving stop/TP distance
+    const slDist = Math.abs(plan.entryPrice - Number(plan.stopPrice));
+    const tpDist = Math.abs(Number(plan.takeProfitPrice) - plan.entryPrice);
+    const adjustedStop = roundPriceToTick(
+      plan.side === 'BUY' ? fill.avgPrice - slDist : fill.avgPrice + slDist,
+      filter.tickSize
+    );
+    const adjustedTp = roundPriceToTick(
+      plan.side === 'BUY' ? fill.avgPrice + tpDist : fill.avgPrice - tpDist,
+      filter.tickSize
+    );
+
+    const stopParams = buildProtectiveAlgoParams({
+      symbol: plan.symbol,
+      entrySide: plan.side,
+      positionMode,
+      positionSide,
+      type: 'STOP_MARKET',
+      triggerPrice: adjustedStop,
+      clientAlgoId: stopClientAlgoId,
+    });
+
+    const tpParams = buildProtectiveAlgoParams({
+      symbol: plan.symbol,
+      entrySide: plan.side,
+      positionMode,
+      positionSide,
+      type: 'TAKE_PROFIT_MARKET',
+      triggerPrice: adjustedTp,
+      clientAlgoId: targetClientAlgoId,
+    });
+
+    let stopAlgoId: number | string | null = null;
+    let targetAlgoId: number | string | null = null;
+    let protectionError = '';
+
+    try {
+      const stopResp = await ctx.binanceRequest<any>(
+        'POST',
+        '/fapi/v1/algoOrder',
+        stopParams,
+        true,
+        ctx.credentials
+      );
+      stopAlgoId = stopResp?.algoId ?? null;
+
+      const tpResp = await ctx.binanceRequest<any>(
+        'POST',
+        '/fapi/v1/algoOrder',
+        tpParams,
+        true,
+        ctx.credentials
+      );
+      targetAlgoId = tpResp?.algoId ?? null;
+
+      // Verify BOTH protective orders are genuinely open via GET /fapi/v1/openAlgoOrders
+      const openAlgos = await fetchOpenAlgoOrdersSafe(
+        ctx.binanceRequest,
+        ctx.credentials,
+        plan.symbol
+      );
+      const slVerified = openAlgos.some(
+        (o) =>
+          o.clientAlgoId === stopClientAlgoId ||
+          (stopAlgoId && String(o.algoId) === String(stopAlgoId))
+      );
+      const tpVerified = openAlgos.some(
+        (o) =>
+          o.clientAlgoId === targetClientAlgoId ||
+          (targetAlgoId && String(o.algoId) === String(targetAlgoId))
+      );
+
+      if (!slVerified || !tpVerified) {
+        protectionError = `Protective exit verification failed on openAlgoOrders (SL=${slVerified}, TP=${tpVerified}).`;
+      }
+    } catch (algoErr: any) {
+      protectionError = algoErr?.message || 'Algo protective order rejected.';
+    }
+
+    const baseRecord: AgentTradeRecord = {
+      id: tradeId,
+      symbol: plan.symbol,
+      side: plan.side,
+      positionMode,
+      positionSide,
+      status: 'OPEN',
+      executionStatus: isPartial ? 'PARTIAL_PROTECTED' : 'FILLED_PROTECTED',
+      requestedQuantity: plan.quantity,
+      executedQuantity: actualQtyStr,
+      leverage: plan.leverage,
+      notionalUsd: actualNotional,
+      riskUsd: Number((actualNumericQty * slDist).toFixed(4)),
+      entryPrice: fill.avgPrice,
+      exitPrice: null,
+      markPrice: fill.avgPrice,
+      stopPrice: Number(adjustedStop),
+      takeProfitPrice: Number(adjustedTp),
+      entryOrderId: fill.orderId,
+      entryClientOrderId: plan.clientOrderId,
+      stopAlgoId,
+      stopClientAlgoId,
+      targetAlgoId,
+      targetClientAlgoId,
+      emergencyOrderId: null,
+      stopStatus: protectionError ? 'FAILED' : 'ARMED',
+      takeProfitStatus: protectionError ? 'FAILED' : 'ARMED',
+      unrealizedPnl: 0,
+      realizedPnl: null,
+      tradingFees: 0,
+      fundingFees: 0,
+      commission: 0,
+      netPnl: null,
+      openedAt: Date.now(),
+      closedAt: null,
+      closeReason: null,
+      signalSnapshot: {
+        quantDirection: quant.direction,
+        heuristicScore: quant.heuristicScore,
+        trendStrength: quant.trendStrength,
+        rsi14: quant.rsi14,
+        ema9: quant.ema9_15m,
+        ema21: quant.ema21_15m,
+        ema50: quant.ema50_15m,
+        atr14: quant.atr14,
+        volatilityPct: quant.volatilityPct,
+        volumeRatio: quant.volumeRatio,
+        breakout: quant.breakout,
+        mtfAligned: quant.mtfAligned,
+        marketRegime: aiResult.marketRegime,
+        aiDirection: aiResult.direction,
+        aiSentiment: aiResult.sentiment,
+        aiConfidence: aiResult.confidence,
+        aiRiskFlags: aiResult.riskFlags,
+        stopDistancePct: plan.stopDistancePct,
+      },
+    };
+
+    if (protectionError) {
+      // Protective Exit Failure Protocol:
+      // 1. Cancel whichever bot-owned Algo protective order succeeded
+      await cancelAlgoOrderSafe(
+        ctx.binanceRequest,
+        ctx.credentials,
+        plan.symbol,
+        stopAlgoId,
+        stopClientAlgoId
+      );
+      await cancelAlgoOrderSafe(
+        ctx.binanceRequest,
+        ctx.credentials,
+        plan.symbol,
+        targetAlgoId,
+        targetClientAlgoId
+      );
+
+      // 2. Safely close actual remaining position via MARKET
+      const closeSide = plan.side === 'BUY' ? 'SELL' : 'BUY';
+      const emergencyClientId = `EMG_${tradeId.slice(3, 15)}`;
+      const closeParams: Record<string, any> = {
+        symbol: plan.symbol,
+        side: closeSide,
+        type: 'MARKET',
+        quantity: actualQtyStr,
+        newClientOrderId: emergencyClientId,
+        newOrderRespType: 'RESULT',
+      };
+      if (positionMode === 'HEDGE') {
+        closeParams.positionSide = positionSide;
+      } else {
+        closeParams.reduceOnly = 'true';
+      }
+
+      let emergencyOrderId: number | string | null = null;
+      let verifiedFlat = false;
+      try {
+        const closeResp = await ctx.binanceRequest<any>(
+          'POST',
+          '/fapi/v1/order',
+          closeParams,
+          true,
+          ctx.credentials
+        );
+        emergencyOrderId = closeResp?.orderId ?? null;
+        // 3. Verify resulting position state on exchange
+        const posRisk = await ctx.binanceRequest<any[]>(
+          'GET',
+          '/fapi/v3/positionRisk',
+          { symbol: plan.symbol },
+          true,
+          ctx.credentials
+        );
+        const remaining = (Array.isArray(posRisk) ? posRisk : []).find(
+          (p) =>
+            p.symbol === plan.symbol &&
+            (positionMode === 'ONE_WAY' || p.positionSide === positionSide)
+        );
+        verifiedFlat = Math.abs(toNum(remaining?.positionAmt)) <= 1e-12;
+      } catch (closeErr: any) {
+        protectionError += ` | Emergency close failed: ${closeErr?.message || 'unknown'}`;
+      }
+
+      baseRecord.emergencyOrderId = emergencyOrderId;
+      baseRecord.status = 'EMERGENCY_CLOSED';
+      baseRecord.executionStatus = verifiedFlat
+        ? 'ROLLBACK_CLOSED'
+        : 'UNCERTAIN_RECOVERY_NEEDED';
+
+      await recordTradeOpened(baseRecord);
+      await recordTradeClosed(baseRecord.id, {
+        status: 'EMERGENCY_CLOSED',
+        exitPrice: fill.avgPrice,
+        realizedPnl: 0,
+        tradingFees: 0,
+        closeReason: verifiedFlat
+          ? `ROLLBACK_FLAT: ${protectionError}`
+          : `CRITICAL_OPEN_EXPOSURE: ${protectionError}`,
+        executionStatus: baseRecord.executionStatus,
+      });
+
+      // 4. Pause new automated entries + 5. Create CRITICAL activity alert & Telegram
+      ctx.onPauseRequired(
+        `Protective exit failed on ${plan.symbol}; automated entries paused`
+      );
+      recordCriticalError(
+        'PROTECTIVE_EXIT_ROLLBACK',
+        `${protectionError} (verifiedFlat=${verifiedFlat})`,
+        plan.symbol
+      );
+      void notifyTelegramEvent(
+        'CRITICAL_FAILURE',
+        `CRITICAL protective exit failure on ${plan.symbol}: ${protectionError}. Emergency close flat=${verifiedFlat}. New entries PAUSED.`
+      );
+
+      return {
+        success: false,
+        tradeRecord: baseRecord,
+        error: protectionError,
+      };
+    }
+
+    await recordTradeOpened(baseRecord);
+
+    appendAgentLog(
+      'AGENT_5_EXECUTION',
+      'TRADE',
+      `DEMO ENTRY ${plan.side} ${actualQtyStr} ${plan.symbol} @ $${fill.avgPrice.toFixed(4)} (${plan.leverage}x) | SL Algo #${stopAlgoId} ($${adjustedStop}) | TP Algo #${targetAlgoId} ($${adjustedTp})${isPartial ? ' [PARTIAL FILL]' : ''}`,
+      plan.symbol
+    );
+
+    void notifyTelegramEvent(
+      'DEMO_ORDER_EXECUTED',
+      `EXECUTED ${plan.side} ${actualQtyStr} ${plan.symbol} @ $${fill.avgPrice.toFixed(4)} ($${actualNotional.toFixed(2)}, ${plan.leverage}x)`
+    );
+    void notifyTelegramEvent(
+      'SL_CONFIRMED',
+      `SL ARMED ${plan.symbol}: Algo #${stopAlgoId} trigger=$${adjustedStop} (MARK_PRICE)`
+    );
+    void notifyTelegramEvent(
+      'TP_CONFIRMED',
+      `TP ARMED ${plan.symbol}: Algo #${targetAlgoId} trigger=$${adjustedTp} (MARK_PRICE)`
+    );
+
+    return {
+      success: true,
+      tradeRecord: baseRecord,
+    };
+  } catch (err: any) {
+    const msg = err?.message || 'Execution error';
+    recordCriticalError('ENTRY_EXECUTION', msg, plan.symbol);
+    void notifyTelegramEvent(
+      'CRITICAL_FAILURE',
+      `Execution failed for ${plan.symbol}: ${msg}`
+    );
+    return {
+      success: false,
+      tradeRecord: null,
+      error: msg,
+    };
+  } finally {
+    ctx.inFlightSymbols.delete(plan.symbol);
+  }
+}
+===== agent.test.ts =====
+// server/agent/agent.test.ts
+// Comprehensive Phase 8 verification suite across Agents 1-6:
+// Discovery, Quant >= 65/100, Gemini schema & DEGRADED fallback,
+// Mathematical Risk Manager, Execution Agent (partial fills, Hedge/One-Way Algo orders,
+// rollback on SL/TP failure, duplicate/ambiguous order protection),
+// Trade Monitor reconciliation, restart persistence, and paper-trading backtest.
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+const tempJournal = path.join(
+  os.tmpdir(),
+  `turboscalp-agent-suite-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+);
+const tempGeminiQuota = path.join(
+  os.tmpdir(),
+  `turboscalp-agent-gemini-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+);
+process.env.TURBOSCALP_AGENT_STORAGE_FILE = tempJournal;
+process.env.TURBOSCALP_GEMINI_STATE_FILE = tempGeminiQuota;
+
+import { filterClosedCandles, type RawKline } from '../quantRoutes.js';
+import {
+  buildProtectiveAlgoParams,
+  executeApprovedOrder,
+  extractFillMetrics,
+  type BinanceRequestFn,
+} from './executionManager.js';
+import {
+  clearGeminiAnalystCache,
+  runGeminiMarketAnalysis,
+  validateGeminiPayloadSchema,
+} from './geminiAnalyst.js';
+import { detectUnusualActivity } from './marketDiscovery.js';
+import { analyzeMarketQuantitatively } from './quantAnalyst.js';
+import {
+  evaluateRisk,
+  floorToStep,
+  HARD_RISK_CONSTANTS,
+  roundPriceToTick,
+  type ExchangeSymbolFilter,
+  type RiskEvaluationInput,
+} from './riskManager.js';
+import {
+  ensureAgentStorageLoaded,
+  getActiveTradeRecord,
+  getCriticalErrors,
+  getPerformanceSummary,
+  getSymbolCooldown,
+  getLearningSamples,
+  recordTradeClosed,
+  DEFAULT_AGENT_CONFIG,
+  sanitizeConfig,
+  notifyTelegramEvent,
+  syncDailyEquity,
+} from './agentStorage.js';
+import {
+  markUncertainStartupTrades,
+  reconcilePositionAndOrders,
+} from './tradeMonitor.js';
+
+function makeCandles(
+  count: number,
+  intervalMs: number,
+  startPrice: number,
+  step: number,
+  endMs: number,
+  spikeLastVol = false
+): RawKline[] {
+  const out: RawKline[] = [];
+  const startOpen = endMs - count * intervalMs;
+  for (let i = 0; i < count; i++) {
+    const openTime = startOpen + i * intervalMs;
+    const closeTime = openTime + intervalMs - 1;
+    const open = Math.max(1, startPrice + i * step);
+    const close = Math.max(1, open + step * 0.92);
+    const high = Math.max(open, close) + Math.abs(step) * 0.5 + 0.1;
+    const low = Math.max(0.5, Math.min(open, close) - Math.abs(step) * 0.5 - 0.1);
+    const isLast = i === count - 1;
+    out.push({
+      openTime,
+      open,
+      high,
+      low,
+      close: isLast ? close + (step >= 0 ? 1 : -1) * Math.abs(step) * 2.5 : close,
+      volume: isLast && spikeLastVol ? 9000 : 1200 + (i % 4) * 50,
+      closeTime,
+    });
+  }
+  return out;
+}
+
+const BTC_FILTER: ExchangeSymbolFilter = {
+  symbol: 'BTCUSDT',
+  status: 'TRADING',
+  contractType: 'PERPETUAL',
+  quoteAsset: 'USDT',
+  tickSize: 0.1,
+  stepSize: 0.001,
+  minQty: 0.001,
+  maxQty: 1000,
+  minNotional: 5,
+};
+
+function makeRiskInput(now = 1_750_000_000_000): RiskEvaluationInput {
+  return {
+    signal: {
+      symbol: 'BTCUSDT',
+      direction: 'BUY',
+      heuristicScore: 80,
+      signalStrengthScore: 80,
+      trendStrength: 85,
+      price: 50_000,
+      stopLoss: 49_500, // riskPerUnit = $500 (1.0%)
+      takeProfit: 50_900,
+      atr14: 300,
+      volatilityPct: 0.6,
+      latestClosedCandleTime: now - 30_000,
+      fetchedAt: now - 2_000,
+    },
+    aiAnalysis: {
+      symbol: 'BTCUSDT',
+      available: true,
+      degraded: false,
+      direction: 'BUY',
+      marketRegime: 'TRENDING',
+      confidence: 0.78,
+      sentiment: 'BULLISH',
+      riskFlags: [],
+      reasoning: '15m trend and 5m momentum agree',
+      analyzedAt: now - 1_000,
+    },
+    account: {
+      connected: true,
+      canTrade: true,
+      orderTestPassed: true,
+      availableBalance: 10_000, // riskAmount = $25; qty = 25/500 = 0.05 BTC ($2500 notional) -> capped at $100 notional = 0.002 BTC
+      totalWalletBalance: 10_000,
+      totalUnrealizedProfit: 0,
+    },
+    openPositions: [],
+    openOrdersCount: 0,
+    symbolFilter: BTC_FILTER,
+    dailyEquity: {
+      dateUtc: '2025-06-15',
+      startingEquity: 10_000,
+      realizedPnlToday: 0,
+    },
+    cooldownUntilMs: null,
+    executionLocked: false,
+    inFlightSymbols: new Set(),
+    duplicateClientOrderExists: false,
+    requireAiApproval: true,
+    minSignalScore: 65,
+    maxNotionalUsd: 100,
+    maxLeverage: 2,
+    proposedClientOrderId: 'TS_BTCUSDT_TEST1',
+    nowMs: now,
+  };
+}
+
+test('TEST 1: Closed candles only & unusual volume/volatility detection', () => {
+  const now = 1_750_000_000_000;
+  const raw = [
+    [now - 900_000, '100', '103', '99', '102', '1200', now - 1],
+    [now - 300_000, '102', '104', '101', '103', '1400', now],
+    [now, '103', '105', '102', '104', '500', now + 299_000], // Unfinished
+  ];
+  const closed = filterClosedCandles(raw, now);
+  assert.equal(closed.length, 2);
+  assert.ok(closed.every((c) => c.closeTime <= now));
+
+  const c15 = makeCandles(60, 15 * 60_000, 100, 0.5, now, true);
+  const c5 = makeCandles(60, 5 * 60_000, 120, 0.2, now, true);
+  const activity = detectUnusualActivity(c5, c15, 4.2);
+  assert.equal(activity.unusualVolume, true);
+  assert.equal(activity.unusualVolatility, true);
+  assert.ok(activity.volumeSpikeRatio15m >= 1.6);
+});
+
+test('TEST 2: Quant Agent score >= 65 & Gemini schema validation + DEGRADED handling', async () => {
+  const now = 1_750_000_000_000;
+  const bull15 = makeCandles(80, 15 * 60_000, 100, 0.7, now, true);
+  const bull5 = makeCandles(80, 5 * 60_000, 138, 0.23, now, true);
+  const quant = analyzeMarketQuantitatively(
+    {
+      symbol: 'ETHUSDT',
+      priceChangePercent: 4.5,
+      quoteVolume: 150_000_000,
+      candles5m: bull5,
+      candles15m: bull15,
+      unusualVolume: true,
+      unusualVolatility: true,
+      latestClosedCandleTime: bull5[bull5.length - 1].closeTime,
+      fetchedAt: now,
+    },
+    65
+  );
+
+  assert.equal(quant.direction, 'BUY');
+  assert.ok(quant.signalStrengthScore >= 65);
+  assert.equal(quant.mtfAligned, true);
+
+  // Valid Gemini JSON schema
+  const valid = validateGeminiPayloadSchema(
+    {
+      symbol: 'ETHUSDT',
+      direction: 'BUY',
+      marketRegime: 'TRENDING',
+      confidence: 0.81,
+      sentiment: 'BULLISH',
+      riskFlags: [],
+      reasoning: '15m and 5m EMAs aligned upward',
+    },
+    'ETHUSDT'
+  );
+  assert.equal(valid.confidence, 0.81);
+  assert.equal(valid.marketRegime, 'TRENDING');
+
+  // Gemini throws 503 / unavailable -> retries then strictly reported as DEGRADED / OVERLOADED
+  clearGeminiAnalystCache();
+  const degradedRes = await runGeminiMarketAnalysis(quant, [], {
+    bypassCache: true,
+    retryDelaysMs: [1, 1],
+    jitterFn: () => 0,
+    minIntervalMs: 0,
+    generateFn: async () => {
+      throw new Error('503 Service Unavailable');
+    },
+  });
+  assert.equal(degradedRes.available, false);
+  assert.equal(degradedRes.degraded, true);
+  assert.equal(degradedRes.direction, 'HOLD');
+  assert.equal(degradedRes.errorCategory, 'CAPACITY_503');
+  assert.ok(degradedRes.riskFlags.some((f) => /DEGRADED|OVERLOADED/i.test(f)));
+});
+
+test('TEST 3: Risk Manager mathematical formula, exchange step/tick rounding & every rejection rule', () => {
+  const now = 1_750_000_000_000;
+  // Exact sizing math without multiplying leverage into risk budget:
+  // balance = 2000 -> riskAmount = 2000 * 0.0025 = $5.00
+  // entry = 50_000, sl = 49_500 -> riskPerUnit = $500
+  // math qty = 5 / 500 = 0.01 BTC -> notional $500 -> capped at MAX_ORDER_NOTIONAL $100 = 0.002 BTC
+  const smallCapInput = makeRiskInput(now);
+  smallCapInput.account.availableBalance = 2_000;
+  const approved = evaluateRisk(smallCapInput);
+  assert.equal(approved.approved, true);
+  assert.equal(approved.orderPlan!.quantity, '0.002');
+  assert.ok(approved.orderPlan!.notionalUsd <= HARD_RISK_CONSTANTS.MAX_ORDER_NOTIONAL_USD);
+  assert.ok(approved.orderPlan!.riskPercentOfAvailable <= HARD_RISK_CONSTANTS.RISK_PER_TRADE_PCT);
+  assert.equal(floorToStep(0.00299, 0.001), '0.002');
+  assert.equal(roundPriceToTick(49500.14, 0.1), '49500.1');
+
+  // When risk budget is smaller than $100 notional cap: balance = $10_000, sl distance = 5% ($2500/unit)
+  // riskAmount = $25 -> qty = 25 / 2500 = 0.01 BTC? Wait 0.01*50000=$500 capped; try balance=$2000, sl=48000 ($2000/unit):
+  // riskAmount = $5 -> qty = 5/2000 = 0.0025 -> step floored 0.002 -> risk = $4.00 (no leverage multiplication)
+  const riskBounded = makeRiskInput(now);
+  riskBounded.account.availableBalance = 2_000;
+  riskBounded.signal.stopLoss = 48_000;
+  riskBounded.signal.takeProfit = 53_000;
+  const rbRes = evaluateRisk(riskBounded);
+  assert.equal(rbRes.approved, true);
+  assert.equal(rbRes.orderPlan!.quantity, '0.002');
+
+  // All mandatory rejection conditions:
+  const cases: Array<[string, (i: RiskEvaluationInput) => void]> = [
+    ['disconnected', (i) => (i.account.connected = false)],
+    ['permission disabled', (i) => (i.account.canTrade = false)],
+    ['order test unconfirmed', (i) => (i.account.orderTestPassed = false)],
+    ['stale data', (i) => (i.signal.fetchedAt = now - 120_000)],
+    ['low score', (i) => (i.signal.signalStrengthScore = 60)],
+    ['AI DEGRADED', (i) => { i.aiAnalysis!.available = false; i.aiAnalysis!.degraded = true; }],
+    ['AI conflict', (i) => (i.aiAnalysis!.direction = 'SELL')],
+    ['invalid stop-loss', (i) => (i.signal.stopLoss = i.signal.price + 100)],
+    ['daily loss limit', (i) => (i.dailyEquity.realizedPnlToday = -105)],
+    ['open position', (i) => (i.openPositions = [{ symbol: 'ETHUSDT', positionAmt: 0.1 }])],
+    ['duplicate order', (i) => (i.duplicateClientOrderExists = true)],
+    ['cooldown', (i) => (i.cooldownUntilMs = now + 600_000)],
+  ];
+
+  for (const [label, mutate] of cases) {
+    const scenario = makeRiskInput(now);
+    mutate(scenario);
+    const out = evaluateRisk(scenario);
+    assert.equal(out.approved, false, `Expected rejection for: ${label}`);
+  }
+});
+
+test('Local Qwen remains advisory unless explicitly enabled in config and Risk Manager input', () => {
+  assert.equal(DEFAULT_AGENT_CONFIG.localAiApprovalEnabled, false);
+  assert.equal(sanitizeConfig({ localAiApprovalEnabled: true }).localAiApprovalEnabled, true);
+  assert.equal(sanitizeConfig({ localAiApprovalEnabled: 1 as any }).localAiApprovalEnabled, false);
+
+  const advisoryInput = makeRiskInput();
+  advisoryInput.aiAnalysis!.provider = 'QWEN_LOCAL';
+  const advisoryDecision = evaluateRisk(advisoryInput);
+  assert.equal(advisoryDecision.approved, false);
+  assert.match(
+    advisoryDecision.checks.find((check) => check.name === 'AI Analyst Approval')?.detail || '',
+    /advisory mode/i
+  );
+
+  const explicitlyEnabledInput = makeRiskInput();
+  explicitlyEnabledInput.aiAnalysis!.provider = 'QWEN_LOCAL';
+  explicitlyEnabledInput.allowLocalAiApproval = true;
+  const enabledDecision = evaluateRisk(explicitlyEnabledInput);
+  assert.equal(enabledDecision.approved, true);
+});
+
+test('TEST 4: Paper-trading closed-candle simulation enforces limits without exchange writes', () => {
+  const now = 1_750_000_000_000;
+  const full15 = makeCandles(110, 15 * 60_000, 100, 0.6, now, true);
+  const full5 = makeCandles(330, 5 * 60_000, 100, 0.2, now, true);
+
+  let executedSimTrades = 0;
+  for (let i = 65; i <= 105; i += 10) {
+    const win15 = full15.slice(0, i);
+    const cutoff = win15[win15.length - 1].closeTime;
+    const win5 = full5.filter((c) => c.closeTime <= cutoff).slice(-80);
+    const sig = analyzeMarketQuantitatively(
+      {
+        symbol: 'BTCUSDT',
+        priceChangePercent: 3.5,
+        quoteVolume: 200_000_000,
+        candles5m: win5,
+        candles15m: win15,
+        unusualVolume: true,
+        unusualVolatility: false,
+        latestClosedCandleTime: cutoff,
+        fetchedAt: cutoff + 500,
+      },
+      65
+    );
+    const decision = evaluateRisk({
+      signal: sig,
+      aiAnalysis: {
+        symbol: 'BTCUSDT',
+        available: true,
+        degraded: false,
+        direction: sig.direction,
+        marketRegime: 'TRENDING',
+        confidence: 0.76,
+        sentiment: sig.direction === 'BUY' ? 'BULLISH' : 'NEUTRAL',
+        riskFlags: [],
+        reasoning: 'Paper simulation alignment',
+        analyzedAt: cutoff + 600,
+      },
+      account: {
+        connected: true,
+        canTrade: true,
+        orderTestPassed: true,
+        availableBalance: 2500,
+        totalWalletBalance: 2500,
+        totalUnrealizedProfit: 0,
+      },
+      openPositions: [],
+      openOrdersCount: 0,
+      symbolFilter: BTC_FILTER,
+      dailyEquity: {
+        dateUtc: '2025-06-15',
+        startingEquity: 2500,
+        realizedPnlToday: 0,
+      },
+      cooldownUntilMs: null,
+      executionLocked: false,
+      inFlightSymbols: new Set(),
+      requireAiApproval: true,
+      nowMs: cutoff + 1000,
+    });
+    if (decision.approved) executedSimTrades++;
+  }
+  assert.ok(executedSimTrades >= 1);
+});
+
+test('TEST 5 & 6: Execution Agent Hedge/One-Way Algo Exits, Partial Fill, Ambiguous Entry Recovery & SL Failure Rollback', async () => {
+  await ensureAgentStorageLoaded();
+
+  // Verify Hedge Mode Algo parameters adhere strictly to Binance rules (no quantity/reduceOnly when closePosition=true, triggerPrice used)
+  const hedgeStop = buildProtectiveAlgoParams({
+    symbol: 'BTCUSDT',
+    entrySide: 'BUY',
+    positionMode: 'HEDGE',
+    positionSide: 'LONG',
+    type: 'STOP_MARKET',
+    triggerPrice: '49500.0',
+    clientAlgoId: 'SL_1',
+  });
+  assert.equal(hedgeStop.algoType, 'CONDITIONAL');
+  assert.equal(hedgeStop.side, 'SELL');
+  assert.equal(hedgeStop.positionSide, 'LONG');
+  assert.equal(hedgeStop.triggerPrice, '49500.0');
+  assert.equal(hedgeStop.workingType, 'MARK_PRICE');
+  assert.equal(hedgeStop.closePosition, 'true');
+  assert.equal((hedgeStop as any).quantity, undefined);
+  assert.equal((hedgeStop as any).reduceOnly, undefined);
+  assert.equal((hedgeStop as any).stopPrice, undefined);
+
+  const fill = extractFillMetrics(
+    { orderId: 901, status: 'PARTIALLY_FILLED', executedQty: '0.001', avgPrice: '50010.0' },
+    50_000
+  );
+  assert.equal(fill.executedQty, 0.001);
+  assert.equal(fill.avgPrice, 50_010);
+
+  // Rollback test: SL succeeds, TP fails -> must cancel SL, MARKET close position, verify flat, pause engine, record CRITICAL error
+  const decision = evaluateRisk(makeRiskInput());
+  assert.equal(decision.approved, true);
+
+  let canceledAlgo = false;
+  let marketCloseCalled = false;
+  let pausedCalled = false;
+
+  const mockBinance = (async (method: string, endpoint: string, params?: Record<string, any>): Promise<any> => {
+    if (endpoint === '/fapi/v1/positionSide/dual') return { dualSidePosition: false };
+    if (endpoint === '/fapi/v1/leverage') return { leverage: 1 };
+    if (method === 'POST' && endpoint === '/fapi/v1/order' && params?.side === 'BUY') {
+      return { orderId: 555, status: 'FILLED', executedQty: '0.002', avgPrice: '50000' };
+    }
+    if (method === 'POST' && endpoint === '/fapi/v1/algoOrder' && params?.type === 'STOP_MARKET') {
+      return { algoId: 777, clientAlgoId: params.clientAlgoId };
+    }
+    if (method === 'POST' && endpoint === '/fapi/v1/algoOrder' && params?.type === 'TAKE_PROFIT_MARKET') {
+      throw new Error('Binance Demo -2021 Order would immediately trigger');
+    }
+    if (method === 'DELETE' && endpoint === '/fapi/v1/algoOrder') {
+      canceledAlgo = true;
+      return { success: true };
+    }
+    if (method === 'POST' && endpoint === '/fapi/v1/order' && params?.side === 'SELL') {
+      marketCloseCalled = true;
+      return { orderId: 556, status: 'FILLED', executedQty: '0.002' };
+    }
+    if (method === 'GET' && endpoint === '/fapi/v3/positionRisk') {
+      return [{ symbol: 'BTCUSDT', positionAmt: '0' }];
+    }
+    return {};
+  }) as BinanceRequestFn;
+
+  const quantMock = analyzeMarketQuantitatively(
+    {
+      symbol: 'BTCUSDT',
+      priceChangePercent: 3.1,
+      quoteVolume: 200_000_000,
+      candles5m: makeCandles(70, 5 * 60_000, 100, 0.25, 1_750_000_000_000, true),
+      candles15m: makeCandles(70, 15 * 60_000, 100, 0.75, 1_750_000_000_000, true),
+      unusualVolume: true,
+      unusualVolatility: false,
+      latestClosedCandleTime: 1_749_999_999_999,
+      fetchedAt: 1_750_000_000_000,
+    },
+    65
+  );
+
+  const rollbackOutcome = await executeApprovedOrder(
+    decision,
+    quantMock,
+    makeRiskInput().aiAnalysis!,
+    BTC_FILTER,
+    {
+      credentials: { apiKey: 'demo-key', apiSecret: 'demo-secret' },
+      binanceRequest: mockBinance,
+      inFlightSymbols: new Set(),
+      onPauseRequired: () => {
+        pausedCalled = true;
+      },
+    }
+  );
+
+  assert.equal(rollbackOutcome.success, false);
+  assert.equal(canceledAlgo, true);
+  assert.equal(marketCloseCalled, true);
+  assert.equal(pausedCalled, true);
+  assert.equal(rollbackOutcome.tradeRecord?.executionStatus, 'ROLLBACK_CLOSED');
+  assert.equal(rollbackOutcome.tradeRecord?.financialsVerified, false);
+  assert.equal(rollbackOutcome.tradeRecord?.realizedPnl, null);
+  assert.equal(rollbackOutcome.tradeRecord?.netPnl, null);
+  assert.equal(
+    getLearningSamples(20).some(
+      (sample) => sample.tradeId === rollbackOutcome.tradeRecord?.id
+    ),
+    false
+  );
+  assert.ok(getCriticalErrors().length >= 1);
+
+  // Verify duplicate clientOrderId is blocked after rollback recorded it
+  const dupBlocked = await executeApprovedOrder(
+    decision,
+    quantMock,
+    makeRiskInput().aiAnalysis!,
+    BTC_FILTER,
+    {
+      credentials: { apiKey: 'demo-key', apiSecret: 'demo-secret' },
+      binanceRequest: mockBinance,
+      inFlightSymbols: new Set(),
+      onPauseRequired: () => {},
+    }
+  );
+  assert.equal(dupBlocked.success, false);
+  assert.match(dupBlocked.error || '', /Duplicate execution blocked/i);
+});
+
+test('TEST 7 & 8: Successful Demo Entry + Protective Algo Verify + Monitor Closure + Cooldown + Non-blocking Telegram', async () => {
+  await ensureAgentStorageLoaded();
+  syncDailyEquity(10_000);
+
+  const freshInput = makeRiskInput();
+  freshInput.proposedClientOrderId = 'TS_BTCUSDT_TEST7';
+  const decision = evaluateRisk(freshInput);
+  assert.equal(decision.approved, true);
+
+  let positionOpenOnExchange = true;
+  let canceledCount = 0;
+
+  const mockExchange = (async (method: string, endpoint: string, params?: Record<string, any>): Promise<any> => {
+    if (endpoint === '/fapi/v1/positionSide/dual') return { dualSidePosition: true };
+    if (endpoint === '/fapi/v1/leverage') return { leverage: 1 };
+    if (method === 'POST' && endpoint === '/fapi/v1/order') {
+      return { orderId: 1001, status: 'FILLED', executedQty: '0.002', avgPrice: '50000' };
+    }
+    if (method === 'POST' && endpoint === '/fapi/v1/algoOrder') {
+      return {
+        algoId: params?.type === 'STOP_MARKET' ? 2001 : 2002,
+        clientAlgoId: params?.clientAlgoId,
+      };
+    }
+    if (method === 'GET' && endpoint === '/fapi/v1/openAlgoOrders') {
+      return positionOpenOnExchange
+        ? [
+            { symbol: 'BTCUSDT', algoId: 2001, clientAlgoId: params?.clientAlgoId || '' },
+            { symbol: 'BTCUSDT', algoId: 2002, clientAlgoId: params?.clientAlgoId || '' },
+          ]
+        : [];
+    }
+    if (endpoint === '/fapi/v3/account') {
+      return {
+        totalWalletBalance: '10001.70',
+        availableBalance: '10001.70',
+        totalUnrealizedProfit: '0',
+      };
+    }
+    if (endpoint === '/fapi/v1/accountConfig') {
+      return {
+        canTrade: true,
+        canDeposit: true,
+        canWithdraw: true,
+        dualSidePosition: true,
+        multiAssetsMargin: false,
+        feeTier: 0,
+      };
+    }
+    if (endpoint === '/fapi/v3/positionRisk') {
+      return positionOpenOnExchange
+        ? [
+            {
+              symbol: 'BTCUSDT',
+              positionSide: 'LONG',
+              positionAmt: '0.002',
+              entryPrice: '50000',
+              markPrice: '50400',
+              unRealizedProfit: '0.80',
+              leverage: '1',
+            },
+          ]
+        : [];
+    }
+    if (endpoint === '/fapi/v1/openOrders') return [];
+    if (endpoint === '/fapi/v1/income') {
+      return [
+        { incomeType: 'REALIZED_PNL', income: '1.80' },
+        { incomeType: 'COMMISSION', income: '-0.08' },
+        { incomeType: 'FUNDING_FEE', income: '-0.02' },
+      ];
+    }
+    if (endpoint === '/fapi/v1/userTrades') {
+      return [{ price: '50900' }];
+    }
+    if (method === 'DELETE' && endpoint === '/fapi/v1/algoOrder') {
+      canceledCount++;
+      return { success: true };
+    }
+    return {};
+  }) as BinanceRequestFn;
+
+  // Customize openAlgoOrders mock to return exact clientAlgoIds created by executionManager
+  const recordedClientAlgoIds: string[] = [];
+  const wrappedExchange = (async (method: any, endpoint: string, params?: Record<string, any>, signed?: boolean, creds?: any): Promise<any> => {
+    if (method === 'POST' && endpoint === '/fapi/v1/algoOrder' && params?.clientAlgoId) {
+      recordedClientAlgoIds.push(params.clientAlgoId);
+    }
+    if (method === 'GET' && endpoint === '/fapi/v1/openAlgoOrders') {
+      return recordedClientAlgoIds.map((id, idx) => ({
+        symbol: 'BTCUSDT',
+        algoId: 2001 + idx,
+        clientAlgoId: id,
+      }));
+    }
+    return mockExchange(method, endpoint, params, signed, creds);
+  }) as BinanceRequestFn;
+
+  const quantMock = analyzeMarketQuantitatively(
+    {
+      symbol: 'BTCUSDT',
+      priceChangePercent: 3.1,
+      quoteVolume: 200_000_000,
+      candles5m: makeCandles(70, 5 * 60_000, 100, 0.25, 1_750_000_000_000, true),
+      candles15m: makeCandles(70, 15 * 60_000, 100, 0.75, 1_750_000_000_000, true),
+      unusualVolume: true,
+      unusualVolatility: false,
+      latestClosedCandleTime: 1_749_999_999_999,
+      fetchedAt: 1_750_000_000_000,
+    },
+    65
+  );
+
+  const execRes = await executeApprovedOrder(
+    decision,
+    quantMock,
+    makeRiskInput().aiAnalysis!,
+    BTC_FILTER,
+    {
+      credentials: { apiKey: 'demo-key', apiSecret: 'demo-secret' },
+      binanceRequest: wrappedExchange,
+      inFlightSymbols: new Set(),
+      onPauseRequired: () => {},
+    }
+  );
+  assert.equal(execRes.success, true);
+  assert.equal(execRes.tradeRecord?.positionMode, 'HEDGE');
+  assert.equal(execRes.tradeRecord?.positionSide, 'LONG');
+  assert.equal(execRes.tradeRecord?.stopStatus, 'ARMED');
+  assert.equal(execRes.tradeRecord?.takeProfitStatus, 'ARMED');
+  assert.ok(getActiveTradeRecord() !== null);
+
+  // Reconcile while open
+  markUncertainStartupTrades(getActiveTradeRecord());
+  const whileOpen = await reconcilePositionAndOrders(
+    wrappedExchange,
+    { apiKey: 'demo-key', apiSecret: 'demo-secret' },
+    30
+  );
+  assert.equal(whileOpen.activeTradeStillOpen, true);
+
+  // Now simulate TP fill on exchange -> position becomes flat
+  positionOpenOnExchange = false;
+  const afterClose = await reconcilePositionAndOrders(
+    wrappedExchange,
+    { apiKey: 'demo-key', apiSecret: 'demo-secret' },
+    30
+  );
+  assert.equal(afterClose.activeTradeStillOpen, false);
+  assert.equal(canceledCount, 2); // Both remaining Algo orders canceled cleanly
+  assert.ok(getSymbolCooldown('BTCUSDT') !== null); // 30m cooldown active
+
+  const perf = getPerformanceSummary(10_001.7);
+  assert.equal(perf.wins, 1);
+  const verifiedSample = getLearningSamples(10).find(
+    (sample) => sample.tradeId === execRes.tradeRecord?.id
+  );
+  assert.equal(verifiedSample?.financialsVerified, true);
+  assert.equal(verifiedSample?.netPnl, 1.7);
+
+  // A repeated close for an already-finalized trade must not change PnL or add a sample.
+  const samplesBeforeDuplicateClose = getLearningSamples(10).length;
+  const closedAtBeforeDuplicateClose = execRes.tradeRecord?.closedAt;
+  await recordTradeClosed(execRes.tradeRecord!.id, {
+    status: 'CLOSED',
+    exitPrice: 50900,
+    realizedPnl: 999,
+    tradingFees: 0,
+    fundingFees: 0,
+    closeReason: 'DUPLICATE_CLOSE_REGRESSION_TEST',
+    executionStatus: 'CLOSED',
+    financialsVerified: true,
+  });
+  assert.equal(getLearningSamples(10).length, samplesBeforeDuplicateClose);
+  assert.equal(execRes.tradeRecord?.closedAt, closedAtBeforeDuplicateClose);
+  assert.equal(execRes.tradeRecord?.netPnl, 1.7);
+
+  assert.equal(perf.totalTradingFees, 0.08);
+  assert.equal(perf.totalFundingFees, -0.02);
+  assert.equal(perf.netRealizedPnl, 1.7);
+
+  // Telegram gracefully no-ops when token/chatId are unset
+  const tgOk = await notifyTelegramEvent('POSITION_CLOSED', 'Test message');
+  assert.equal(tgOk, false);
+});
+
+test.after(async () => {
+  await Promise.all([
+    fs.rm(tempJournal, { force: true }).catch(() => {}),
+    fs.rm(tempGeminiQuota, { force: true }).catch(() => {}),
+  ]);
+});
