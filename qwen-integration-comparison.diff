@@ -1,0 +1,418 @@
+QWEN INTEGRATION COMPARISON
+
+
+========== server\agent\agentStorage.ts ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\agentStorage.ts" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\agentStorage.ts"
+index 0c8c9c1..a651252 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\agentStorage.ts"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\agentStorage.ts"
+@@ -35,11 +35,11 @@ export interface AgentUnitStatus {
+   status: AgentHealthState;
+   lastRunAt: number | null;
+   detail: string;
+ }
+ 
+-export type TradingPolicyMode = 'AI_REQUIRED' | 'QUANT_ONLY_PAPER';
++export type TradingPolicyMode = 'GEMINI_REQUIRED' | 'QUANT_ONLY_PAPER';
+ 
+ export interface AgentEngineConfig {
+   environment: 'USD_M_FUTURES_DEMO';
+   minSignalScore: number;
+   riskPerTradePct: number;
+@@ -47,14 +47,14 @@ export interface AgentEngineConfig {
+   maxOpenPositions: number;
+   maxOrderNotionalUsd: number;
+   maxDailyLossPct: number;
+   cooldownMinutes: number;
+   requireAiApproval: boolean;
+-  /** Local Qwen may satisfy the AI gate only after explicit opt-in. Defaults to false. */
+-  localAiApprovalEnabled: boolean;
+   tradingPolicy: TradingPolicyMode;
+   quantOnlyPaperMode: boolean;
++  // Qwen analysis is advisory unless explicitly enabled after validation.
++  localAiApprovalEnabled: boolean;
+ }
+ 
+ export const DEFAULT_AGENT_CONFIG: AgentEngineConfig = Object.freeze({
+   environment: 'USD_M_FUTURES_DEMO',
+   minSignalScore: 65,
+@@ -63,13 +63,13 @@ export const DEFAULT_AGENT_CONFIG: AgentEngineConfig = Object.freeze({
+   maxOpenPositions: 1,
+   maxOrderNotionalUsd: 100,
+   maxDailyLossPct: 1.0,
+   cooldownMinutes: 30,
+   requireAiApproval: true,
+-  localAiApprovalEnabled: false,
+-  tradingPolicy: 'AI_REQUIRED',
++  tradingPolicy: 'GEMINI_REQUIRED',
+   quantOnlyPaperMode: false,
++  localAiApprovalEnabled: false,
+ });
+ 
+ export interface SignalLearningSnapshot {
+   quantDirection: 'BUY' | 'SELL' | 'HOLD';
+   heuristicScore: number;
+@@ -377,22 +377,22 @@ export function sanitizeConfig(
+     cooldownMinutes: clamp(
+       Number(partial.cooldownMinutes ?? DEFAULT_AGENT_CONFIG.cooldownMinutes),
+       5,
+       240
+     ),
+-    requireAiApproval: true, // AI approval remains required for automated Demo entries
+-    localAiApprovalEnabled: partial.localAiApprovalEnabled === true,
++    requireAiApproval: true, // GEMINI_REQUIRED is always enforced for automated Demo entries
+     tradingPolicy:
+       partial.tradingPolicy === 'QUANT_ONLY_PAPER' &&
+       partial.quantOnlyPaperMode === true
+         ? 'QUANT_ONLY_PAPER'
+-        : 'AI_REQUIRED',
++        : 'GEMINI_REQUIRED',
+     quantOnlyPaperMode:
+       partial.tradingPolicy === 'QUANT_ONLY_PAPER' ||
+       partial.quantOnlyPaperMode === true
+         ? Boolean(partial.quantOnlyPaperMode ?? (partial.tradingPolicy === 'QUANT_ONLY_PAPER'))
+         : false,
++    localAiApprovalEnabled: partial.localAiApprovalEnabled === true,
+   };
+ }
+ 
+ export function persistAgentStorage(): Promise<void> {
+   persistChain = persistChain
+
+
+
+========== server\agent\geminiRequestManager.ts ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\geminiRequestManager.ts" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\geminiRequestManager.ts"
+index 5e8425f..c189441 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\geminiRequestManager.ts"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\geminiRequestManager.ts"
+@@ -64,11 +64,11 @@ export type GeminiErrorCategory =
+ export type GeminiMarketRegime = 'TRENDING' | 'SIDEWAYS' | 'VOLATILE' | 'CONFLICTED';
+ export type GeminiSentiment = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+ 
+ export interface GeminiAnalysisResult {
+   symbol: string;
+-  /** Identifies the analysis source; omitted for legacy Gemini results. */
++  // Provider-neutral marker; Qwen uses the same validated result contract.
+   provider?: 'GEMINI' | 'QWEN_LOCAL';
+   available: boolean;
+   degraded: boolean;
+   quotaExhausted?: boolean;
+   fromCache?: boolean;
+
+
+
+========== src\types.ts ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\src\\types.ts" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\src\\types.ts"
+index f089f40..e4ad58d 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\src\\types.ts"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\src\\types.ts"
+@@ -208,11 +208,11 @@ export type GeminiErrorCategory =
+   | 'INVALID_ARGUMENT_400'
+   | 'AUTH_401_403'
+   | 'NETWORK_ERROR'
+   | 'CONFIG_ERROR'
+   | 'SCHEMA_ERROR';
+-export type TradingPolicyMode = 'AI_REQUIRED' | 'QUANT_ONLY_PAPER';
++export type TradingPolicyMode = 'GEMINI_REQUIRED' | 'QUANT_ONLY_PAPER';
+ 
+ export interface AgentUnitStatus {
+   id: AgentName;
+   label: string;
+   role: string;
+@@ -229,13 +229,13 @@ export interface AgentEngineConfig {
+   maxOpenPositions: number;
+   maxOrderNotionalUsd: number;
+   maxDailyLossPct: number;
+   cooldownMinutes: number;
+   requireAiApproval: boolean;
+-  localAiApprovalEnabled: boolean;
+   tradingPolicy: TradingPolicyMode;
+   quantOnlyPaperMode: boolean;
++  localAiApprovalEnabled: boolean;
+ }
+ 
+ export interface QuantAnalysisResult {
+   symbol: string;
+   direction: 'BUY' | 'SELL' | 'HOLD';
+
+
+
+========== server\agent\riskManager.ts ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\riskManager.ts" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\riskManager.ts"
+index fe42cbd..65ad871 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\riskManager.ts"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\riskManager.ts"
+@@ -114,11 +114,11 @@ export interface RiskEvaluationInput {
+   cooldownUntilMs: number | null;
+   executionLocked: boolean;
+   inFlightSymbols: Set<string>;
+   duplicateClientOrderExists?: boolean;
+   requireAiApproval: boolean;
+-  /** Qwen remains advisory unless the independent setting is explicitly true. */
++  // Local Qwen can satisfy this gate only after a separate explicit enable.
+   allowLocalAiApproval?: boolean;
+   minSignalScore?: number;
+   maxNotionalUsd?: number;
+   maxLeverage?: number;
+   proposedClientOrderId?: string;
+
+
+
+========== server\agent\agentEngine.ts ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\agentEngine.ts" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\agentEngine.ts"
+index 0d9241d..9966486 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\agentEngine.ts"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\agentEngine.ts"
+@@ -570,11 +570,11 @@ async function runOrchestrationCycle(): Promise<void> {
+         'STANDBY',
+         `Waiting for a qualified directional setup (minimum ${cfg.minSignalScore}/100). Local Qwen is primary; Gemini remains optional.`
+       );
+     }
+ 
+-    // Agent 4: Mathematical Risk Manager evaluation (AI approval is required for automated Demo entries)
++    // Agent 4: Mathematical Risk Manager evaluation (GEMINI_REQUIRED enforced for automated Demo entries)
+     const filterMap = new Map<string, ExchangeSymbolFilter>(
+       discovered.markets.map((m) => [m.symbol, m.filter])
+     );
+ 
+     const runRiskFor = (
+@@ -634,11 +634,11 @@ async function runOrchestrationCycle(): Promise<void> {
+         aiAnalysis: aiForSymbol,
+         riskDecision: decision,
+       };
+     };
+ 
+-    // Always require AI approval for actual Demo execution risk gates
++    // Always require AI approval (GEMINI_REQUIRED = true) for actual Demo execution risk gates
+     bestBuyOpportunity = runRiskFor(bestBuyQuant, true);
+     bestSellOpportunity = runRiskFor(bestSellQuant, true);
+ 
+     // Explicitly configured QUANT_ONLY paper-testing evaluation (never auto-activated, never places Demo orders)
+     if (cfg.quantOnlyPaperMode && mode === 'SCAN_ONLY' && qualifiedCandidates.length > 0) {
+
+
+
+========== src\components\MultiAgentPanel.tsx ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\src\\components\\MultiAgentPanel.tsx" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\src\\components\\MultiAgentPanel.tsx"
+index ff1fcd1..8b1c25b 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\src\\components\\MultiAgentPanel.tsx"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\src\\components\\MultiAgentPanel.tsx"
+@@ -424,11 +424,11 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
+     setBusyAction('POLICY');
+     setActionError('');
+     try {
+       await updateAgentConfig({
+         quantOnlyPaperMode: nextEnabled,
+-        tradingPolicy: nextEnabled ? 'QUANT_ONLY_PAPER' : 'AI_REQUIRED',
++        tradingPolicy: nextEnabled ? 'QUANT_ONLY_PAPER' : 'GEMINI_REQUIRED',
+       });
+       await refreshData();
+     } catch (err: any) {
+       setActionError(err?.message || 'Failed to update trading policy.');
+     } finally {
+@@ -758,11 +758,11 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
+                         ? 'text-emerald-400'
+                         : 'text-slate-400'
+               }`}
+             />
+             <h3 className="text-xs font-bold tracking-wider text-white">
+-              GEMINI SERVICE (OPTIONAL)
++              GEMINI AI ANALYST
+             </h3>
+             <span
+               data-testid="gemini-status-badge"
+               className={`text-xs font-black tracking-wide ${
+                 isQuotaExhausted
+@@ -788,16 +788,13 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
+             )}
+           </div>
+ 
+           <div className="flex flex-wrap items-center gap-2.5 text-[11px]">
+             <span className="text-slate-400">
+-              AI Approval:{' '}
++              Trading Policy:{' '}
+               <span className="font-semibold text-cyan-300">
+-                REQUIRED
+-              </span>
+-              <span className="text-slate-500" data-testid="local-qwen-approval-mode">
+-                Local Qwen trade approval: {status?.config?.localAiApprovalEnabled ? 'ENABLED' : 'DISABLED (ADVISORY)'}
++                GEMINI_REQUIRED = true
+               </span>
+             </span>
+             <span className="text-slate-500 tabular-nums">
+               Quota: {geminiStatus?.requestsUsedToday ?? 0} / {geminiStatus?.maxDailyRequests ?? 12}
+             </span>
+@@ -1092,11 +1089,11 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
+             <div className="border border-slate-800 bg-[#080f1b] rounded-xl p-4 space-y-3">
+               <div className="flex items-center justify-between border-b border-slate-800/80 pb-2.5">
+                 <div className="flex items-center gap-2">
+                   <Brain className="w-4 h-4 text-cyan-400" />
+                   <span className="text-xs font-semibold text-white">
+-                    Agent 3: Gemini AI Market Analyst
++                    Agent 3: Local Qwen AI Analyst
+                   </span>
+                 </div>
+                 <span
+                   className={`text-xs font-semibold ${
+                     aiAnalysis?.result?.quotaExhausted
+@@ -1140,11 +1137,11 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
+                       </p>
+                     </div>
+                     <div>
+                       <p className="text-[11px] text-slate-500">Model Used</p>
+                       <p className="font-mono text-[11px] font-semibold text-slate-200 truncate">
+-                        {aiAnalysis.result.modelUsed || geminiStatus?.primaryModel || 'gemini-4-hydrogen'}
++                        {aiAnalysis.result.modelUsed || (aiAnalysis.result.provider === 'QWEN_LOCAL' ? 'qwen3.5:4b (LOCAL)' : geminiStatus?.primaryModel || 'Gemini optional')}
+                       </p>
+                     </div>
+                     <div>
+                       <p className="text-[11px] text-slate-500">Status</p>
+                       <p
+@@ -1173,11 +1170,11 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
+                     </p>
+                   )}
+                 </div>
+               ) : (
+                 <p className="text-xs text-slate-500 py-3">
+-                  No AI evaluation run yet. Gemini analyzes quantitative outputs and flags regime conflicts without direct order execution rights.
++                  Local Qwen analyzes the top qualified quantitative candidate in the background. Gemini remains an optional cloud diagnostic. Qwen cannot approve Demo entries unless localAiApprovalEnabled is explicitly enabled and all Risk Manager checks pass.
+                 </p>
+               )}
+             </div>
+ 
+             {/* Mathematical Risk Manager Gate */}
+
+
+
+========== server\ollamaRoutes.ts ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\ollamaRoutes.ts" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\ollamaRoutes.ts"
+index 66cdb97..715eb60 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\ollamaRoutes.ts"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\ollamaRoutes.ts"
+@@ -345,14 +345,14 @@ export async function analyzeWithOllama(
+             }
+           ],
+           format: ANALYSIS_SCHEMA,
+           stream: false,
+           think: false,
+-          keep_alive: "10m",
++          keep_alive: "30s",
+           options: {
+             temperature: 0,
+-            num_ctx: 2048,
++            num_ctx: 1024,
+             num_predict: 160
+           }
+         },
+         {
+           timeout: config.timeoutMs,
+
+
+
+========== server\ollamaRoutes.test.ts ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\ollamaRoutes.test.ts" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\ollamaRoutes.test.ts"
+index a2ddf5f..62cf78c 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\ollamaRoutes.test.ts"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\ollamaRoutes.test.ts"
+@@ -188,13 +188,13 @@ test('analyzeWithOllama sends think:false, num_ctx:2048, num_predict:160 and enf
+     assert.equal(firstJson.analysis.decision, 'BUY');
+     assert.equal(isOllamaBusy(), false);
+ 
+     assert.equal(capturedBody.think, false);
+     assert.equal(capturedBody.stream, false);
+-    assert.equal(capturedBody.keep_alive, '10m');
++    assert.equal(capturedBody.keep_alive, '30s');
+     assert.equal(capturedBody.options.temperature, 0);
+-    assert.equal(capturedBody.options.num_ctx, 2048);
++    assert.equal(capturedBody.options.num_ctx, 1024);
+     assert.equal(capturedBody.options.num_predict, 160);
+     assert.equal(capturedConfig.timeout, 300000);
+   } finally {
+     server.close();
+   }
+
+
+
+========== server\agent\agent.test.ts ==========
+diff --git "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\agent.test.ts" "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\agent.test.ts"
+index 6ad8fce..5e9652c 100644
+--- "a/C:\\Users\\milan\\TurboScalp-patch2-check\\server\\agent\\agent.test.ts"
++++ "b/C:\\Users\\milan\\TurboScalp-Git-Clean\\server\\agent\\agent.test.ts"
+@@ -48,12 +48,10 @@ import {
+   ensureAgentStorageLoaded,
+   getActiveTradeRecord,
+   getCriticalErrors,
+   getPerformanceSummary,
+   getSymbolCooldown,
+-  DEFAULT_AGENT_CONFIG,
+-  sanitizeConfig,
+   notifyTelegramEvent,
+   syncDailyEquity,
+ } from './agentStorage.js';
+ import {
+   markUncertainStartupTrades,
+@@ -158,10 +156,30 @@ function makeRiskInput(now = 1_750_000_000_000): RiskEvaluationInput {
+     proposedClientOrderId: 'TS_BTCUSDT_TEST1',
+     nowMs: now,
+   };
+ }
+ 
++test('Local Qwen is advisory by default and can only satisfy AI approval when explicitly enabled', () => {
++  const input = makeRiskInput();
++  input.aiAnalysis = {
++    ...input.aiAnalysis!,
++    provider: 'QWEN_LOCAL',
++    modelUsed: 'qwen3.5:4b (LOCAL)',
++  };
++  input.allowLocalAiApproval = false;
++
++  const advisoryDecision = evaluateRisk(input);
++  const advisoryGate = advisoryDecision.checks.find((check) => check.name === 'AI Analyst Approval');
++  assert.equal(advisoryGate?.passed, false);
++  assert.match(advisoryGate?.detail || '', /advisory mode/i);
++
++  input.allowLocalAiApproval = true;
++  const enabledDecision = evaluateRisk(input);
++  const enabledGate = enabledDecision.checks.find((check) => check.name === 'AI Analyst Approval');
++  assert.equal(enabledGate?.passed, true);
++});
++
+ test('TEST 1: Closed candles only & unusual volume/volatility detection', () => {
+   const now = 1_750_000_000_000;
+   const raw = [
+     [now - 900_000, '100', '103', '99', '102', '1200', now - 1],
+     [now - 300_000, '102', '104', '101', '103', '1400', now],
+@@ -285,31 +303,10 @@ test('TEST 3: Risk Manager mathematical formula, exchange step/tick rounding & e
+     const out = evaluateRisk(scenario);
+     assert.equal(out.approved, false, `Expected rejection for: ${label}`);
+   }
+ });
+ 
+-test('Local Qwen remains advisory unless explicitly enabled in config and Risk Manager input', () => {
+-  assert.equal(DEFAULT_AGENT_CONFIG.localAiApprovalEnabled, false);
+-  assert.equal(sanitizeConfig({ localAiApprovalEnabled: true }).localAiApprovalEnabled, true);
+-  assert.equal(sanitizeConfig({ localAiApprovalEnabled: 1 as any }).localAiApprovalEnabled, false);
+-
+-  const advisoryInput = makeRiskInput();
+-  advisoryInput.aiAnalysis!.provider = 'QWEN_LOCAL';
+-  const advisoryDecision = evaluateRisk(advisoryInput);
+-  assert.equal(advisoryDecision.approved, false);
+-  assert.match(
+-    advisoryDecision.checks.find((check) => check.name === 'AI Analyst Approval')?.detail || '',
+-    /advisory mode/i
+-  );
+-
+-  const explicitlyEnabledInput = makeRiskInput();
+-  explicitlyEnabledInput.aiAnalysis!.provider = 'QWEN_LOCAL';
+-  explicitlyEnabledInput.allowLocalAiApproval = true;
+-  const enabledDecision = evaluateRisk(explicitlyEnabledInput);
+-  assert.equal(enabledDecision.approved, true);
+-});
+-
+ test('TEST 4: Paper-trading closed-candle simulation enforces limits without exchange writes', () => {
+   const now = 1_750_000_000_000;
+   const full15 = makeCandles(110, 15 * 60_000, 100, 0.6, now, true);
+   const full5 = makeCandles(330, 5 * 60_000, 100, 0.2, now, true);
+ 
+
