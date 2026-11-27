@@ -192,6 +192,11 @@ test('analyzeWithOllama sends think:false, num_ctx:2048, num_predict:160 and enf
       body: JSON.stringify({
         symbol: 'ETHUSDT',
         quant: { direction: 'BUY', score: 81, price: 3250, rsi: 61.5 },
+        learning: {
+          overall: { sampleCount: 10, wins: 6, losses: 3, flats: 1, winRatePct: 66.7, avgNetPnl: 2.35 },
+          symbol: { sampleCount: 4, wins: 2, losses: 1, flats: 1, winRatePct: 66.7, avgNetPnl: 0.42 },
+          recentOutcomes: [{ side: 'BUY', outcome: 'WIN' }],
+        },
       }),
     });
 
@@ -227,6 +232,12 @@ test('analyzeWithOllama sends think:false, num_ctx:2048, num_predict:160 and enf
     assert.equal(capturedBody.options.temperature, 0);
     assert.equal(capturedBody.options.num_ctx, 2048);
     assert.equal(capturedBody.options.num_predict, 160);
+    const sentContext = JSON.parse(capturedBody.messages[1].content);
+    assert.equal(sentContext.historicalLearning.overall.sampleCount, 10);
+    assert.equal(sentContext.historicalLearning.symbol.winRatePct, 66.7);
+    assert.deepEqual(sentContext.historicalLearning.recentOutcomes, [
+      { side: 'BUY', outcome: 'WIN' },
+    ]);
     assert.equal(capturedConfig.timeout, 300000);
   } finally {
     server.close();
