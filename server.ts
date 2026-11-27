@@ -32,6 +32,7 @@ import {
   runNonExecutingPermissionDiagnostic,
   type FuturesPermissionDiagnostics,
 } from './server/permissionDiagnostics.js';
+import { registerOllamaRoutes } from './server/ollamaRoutes.js';
 
 dotenv.config();
 
@@ -564,6 +565,11 @@ registerAgentEngineRoutes(app, {
   getCredentials: (req, required = false) =>
     getSessionCredentials(req, required),
   binanceRequest,
+  validateMutationOrigin,
+});
+
+// Local Ollama AI Analyst routes (/api/agent/ollama/*)
+registerOllamaRoutes(app, {
   validateMutationOrigin,
 });
 

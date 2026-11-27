@@ -2,6 +2,7 @@ export type OllamaDirection = 'BUY' | 'SELL' | 'NEUTRAL' | 'HOLD';
 
 export interface OllamaQuantInput {
   direction: OllamaDirection;
+  score: number;
   price: number;
   rsi?: number | null;
   ema9?: number | null;
@@ -22,6 +23,7 @@ export interface OllamaStatus {
   status: 'READY' | 'OFFLINE' | 'MODEL_NOT_INSTALLED' | 'CONFIGURATION_ERROR' | string;
   model: string;
   installedModels: string[];
+  busy?: boolean;
   lastCheckedAt: string;
   message: string;
 }
@@ -52,6 +54,18 @@ export interface OllamaAnalysisResponse {
   note: string;
 }
 
+export class OllamaApiError extends Error {
+  statusCode: number;
+  code?: string;
+
+  constructor(message: string, statusCode: number, code?: string) {
+    super(message);
+    this.name = 'OllamaApiError';
+    this.statusCode = statusCode;
+    this.code = code;
+  }
+}
+
 async function apiRequest<T>(url: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -59,16 +73,18 @@ async function apiRequest<T>(url: string, init: RequestInit = {}): Promise<T> {
     cache: 'no-store',
     headers: {
       ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      ...init.headers
-    }
+      ...init.headers,
+    },
   });
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data?.success === false) {
-    const message = typeof data?.message === 'string'
-      ? data.message
-      : `Ollama request failed (HTTP ${response.status}).`;
-    throw new Error(message);
+    const message =
+      typeof data?.message === 'string'
+        ? data.message
+        : `Ollama request failed (HTTP ${response.status}).`;
+    const code = typeof data?.code === 'string' ? data.code : undefined;
+    throw new OllamaApiError(message, response.status, code);
   }
   return data as T;
 }
@@ -78,11 +94,14 @@ export async function getOllamaStatus(): Promise<OllamaStatus> {
   // is not installed. Preserve its diagnostic JSON instead of throwing it away.
   const response = await fetch('/api/agent/ollama/status', {
     credentials: 'same-origin',
-    cache: 'no-store'
+    cache: 'no-store',
   });
   const data = await response.json().catch(() => ({}));
-  if (!data || typeof data !== 'object') {
-    throw new Error(`Invalid Ollama status response (HTTP ${response.status}).`);
+  if (!data || typeof data !== 'object' || typeof data.status !== 'string') {
+    throw new OllamaApiError(
+      `Invalid Ollama status response (HTTP ${response.status}).`,
+      response.status
+    );
   }
   return data as OllamaStatus;
 }
@@ -93,6 +112,6 @@ export function analyzeWithOllama(
 ): Promise<OllamaAnalysisResponse> {
   return apiRequest<OllamaAnalysisResponse>('/api/agent/ollama/analyze', {
     method: 'POST',
-    body: JSON.stringify({ symbol, quant })
+    body: JSON.stringify({ symbol, quant }),
   });
 }

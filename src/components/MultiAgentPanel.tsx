@@ -31,6 +31,14 @@ import {
   type OpportunitySnapshot,
 } from '../services/agentService';
 import type { FuturesPermissionDiagnostics } from '../services/binanceService';
+import {
+  analyzeWithOllama,
+  getOllamaStatus,
+  OllamaApiError,
+  type OllamaAnalysisResponse,
+  type OllamaQuantInput,
+  type OllamaStatus,
+} from '../services/ollamaService';
 import { PermissionDiagnosticsCard } from './PermissionDiagnosticsCard';
 
 interface MultiAgentPanelProps {
@@ -238,6 +246,14 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
   const [confirmChecked, setConfirmChecked] = useState(false);
   const [activeTab, setActiveTab] = useState<'OVERVIEW' | 'SCANNER' | 'LEARNING' | 'LOGS'>('OVERVIEW');
 
+  // Local Qwen Analyst (Ollama) state — strictly manual / on-demand, never polled aggressively
+  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
+  const [ollamaChecking, setOllamaChecking] = useState<boolean>(true);
+  const [ollamaAnalyzingSide, setOllamaAnalyzingSide] = useState<'BUY' | 'SELL' | null>(null);
+  const [ollamaAnalysis, setOllamaAnalysis] = useState<OllamaAnalysisResponse | null>(null);
+  const [ollamaError, setOllamaError] = useState<string>('');
+  const [ollamaErrorCode, setOllamaErrorCode] = useState<string | null>(null);
+
   const refreshData = useCallback(async () => {
     try {
       const [s, l] = await Promise.all([fetchAgentStatus(), fetchAgentLogs(150)]);
@@ -248,11 +264,81 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
     }
   }, []);
 
+  const refreshOllamaStatus = useCallback(async () => {
+    setOllamaChecking(true);
+    setOllamaError('');
+    setOllamaErrorCode(null);
+    try {
+      const next = await getOllamaStatus();
+      setOllamaStatus(next);
+    } catch (err: any) {
+      const message = err?.message || 'Unable to check local Ollama status.';
+      setOllamaError(message);
+      setOllamaErrorCode(err instanceof OllamaApiError ? err.code || null : null);
+      setOllamaStatus({
+        success: false,
+        provider: 'OLLAMA_LOCAL',
+        status: 'OFFLINE',
+        model: 'qwen3.5:4b',
+        installedModels: [],
+        lastCheckedAt: new Date().toISOString(),
+        message,
+      });
+    } finally {
+      setOllamaChecking(false);
+    }
+  }, []);
+
+  const handleAnalyzeWithOllama = async (
+    side: 'BUY' | 'SELL',
+    opportunity: OpportunitySnapshot | null
+  ) => {
+    if (!opportunity || ollamaAnalyzingSide !== null || ollamaStatus?.status !== 'READY') {
+      return;
+    }
+
+    const q = opportunity.quant;
+    const payload: OllamaQuantInput = {
+      direction: q.direction,
+      score: q.signalStrengthScore,
+      price: q.price,
+      rsi: q.rsi14,
+      ema9: q.ema9_15m,
+      ema21: q.ema21_15m,
+      ema50: q.ema50_15m,
+      macd: q.macd,
+      macdSignal: q.macdSignal,
+      atr: q.atr14,
+      volumeRatio: q.volumeRatio,
+      volatilityPct: q.volatilityPct,
+      change24h: q.change24h,
+      volume24h: q.quoteVolume,
+    };
+
+    setOllamaAnalyzingSide(side);
+    setOllamaError('');
+    setOllamaErrorCode(null);
+    try {
+      const response = await analyzeWithOllama(q.symbol, payload);
+      setOllamaAnalysis(response);
+    } catch (err: any) {
+      const message = err?.message || 'Local Qwen analysis failed.';
+      setOllamaError(message);
+      setOllamaErrorCode(err instanceof OllamaApiError ? err.code || null : null);
+    } finally {
+      setOllamaAnalyzingSide(null);
+    }
+  };
+
   useEffect(() => {
     void refreshData();
     const timer = window.setInterval(() => void refreshData(), 4_000);
     return () => window.clearInterval(timer);
   }, [refreshData]);
+
+  useEffect(() => {
+    void refreshOllamaStatus();
+  }, [refreshOllamaStatus]);
 
   const handleStartScanner = async () => {
     setBusyAction('START_SCANNER');
@@ -416,6 +502,45 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
     geminiState === 'RECOVERING' || primaryStatusDisplay === 'RECOVERING';
   const isGeminiDegraded = geminiState === 'DEGRADED';
   const quantOnlyPaperEnabled = status?.config?.quantOnlyPaperMode === true;
+
+  const bestBuyCandidate = status?.opportunities?.bestBuy ?? null;
+  const bestSellCandidate = status?.opportunities?.bestSell ?? null;
+
+  const ollamaDisplayState:
+    | 'CHECKING'
+    | 'READY'
+    | 'OFFLINE'
+    | 'MODEL NOT INSTALLED'
+    | 'BUSY'
+    | 'ERROR' = (() => {
+    if (ollamaAnalyzingSide !== null || ollamaErrorCode === 'OLLAMA_BUSY' || ollamaStatus?.busy) {
+      return 'BUSY';
+    }
+    if (ollamaChecking && !ollamaStatus) {
+      return 'CHECKING';
+    }
+    if (ollamaError) {
+      return 'ERROR';
+    }
+    if (!ollamaStatus) {
+      return 'CHECKING';
+    }
+    if (ollamaStatus.status === 'READY') return 'READY';
+    if (ollamaStatus.status === 'MODEL_NOT_INSTALLED') return 'MODEL NOT INSTALLED';
+    if (ollamaStatus.status === 'OFFLINE') return 'OFFLINE';
+    return 'ERROR';
+  })();
+
+  const ollamaStatusColor =
+    ollamaDisplayState === 'READY'
+      ? 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10'
+      : ollamaDisplayState === 'BUSY'
+        ? 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10'
+        : ollamaDisplayState === 'CHECKING'
+          ? 'text-slate-300 border-slate-700 bg-slate-900'
+          : ollamaDisplayState === 'MODEL NOT INSTALLED'
+            ? 'text-amber-300 border-amber-500/40 bg-amber-500/10'
+            : 'text-rose-300 border-rose-500/40 bg-rose-500/10';
 
   return (
     <section className="border border-slate-800 bg-[#0b1322] rounded-2xl p-5 space-y-6">
@@ -1111,6 +1236,229 @@ export const MultiAgentPanel: React.FC<MultiAgentPanelProps> = ({
                 </p>
               )}
             </div>
+          </div>
+
+          {/* Local Qwen Analyst (Ollama — Advisory Only) */}
+          <div
+            data-testid="local-qwen-analyst-card"
+            className="border border-slate-800 bg-[#080f1b] rounded-xl p-4 space-y-3.5"
+          >
+            <div className="flex flex-col gap-3 border-b border-slate-800/80 pb-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <Cpu className="w-4 h-4 text-emerald-400 shrink-0" />
+                <h3 className="text-xs font-bold tracking-wider text-white">
+                  LOCAL QWEN ANALYST
+                </h3>
+                <span
+                  data-testid="ollama-status-badge"
+                  className={`rounded border px-2 py-0.5 text-[10px] font-bold tracking-wide ${ollamaStatusColor}`}
+                >
+                  {ollamaDisplayState}
+                </span>
+                <span
+                  data-testid="ollama-model-name"
+                  className="font-mono text-[11px] font-semibold text-cyan-300"
+                >
+                  {ollamaStatus?.model || 'qwen3.5:4b'}
+                </span>
+                <span className="text-[11px] text-slate-500">
+                  Advisory Only · No Order Authority
+                </span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  data-testid="ollama-refresh-status-btn"
+                  onClick={() => void refreshOllamaStatus()}
+                  disabled={ollamaChecking || ollamaAnalyzingSide !== null}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-slate-200 transition hover:bg-slate-800 disabled:opacity-40 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3 h-3 ${ollamaChecking ? 'animate-spin' : ''}`} />
+                  {ollamaChecking ? 'Checking...' : 'Refresh Status'}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="ollama-analyze-buy-btn"
+                  onClick={() => void handleAnalyzeWithOllama('BUY', bestBuyCandidate)}
+                  disabled={
+                    !bestBuyCandidate ||
+                    ollamaStatus?.status !== 'READY' ||
+                    ollamaAnalyzingSide !== null ||
+                    ollamaChecking
+                  }
+                  title={
+                    !bestBuyCandidate
+                      ? 'Run the market scanner first to detect a BUY candidate.'
+                      : ollamaStatus?.status !== 'READY'
+                        ? 'Local Ollama model must be READY before running analysis.'
+                        : `Analyze ${bestBuyCandidate.symbol} with local Qwen`
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-[11px] font-semibold text-emerald-200 transition hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
+                >
+                  <TrendingUp className="w-3.5 h-3.5" />
+                  {ollamaAnalyzingSide === 'BUY'
+                    ? `Analyzing ${bestBuyCandidate?.symbol ?? 'BUY'}...`
+                    : bestBuyCandidate
+                      ? `Analyze BUY Candidate (${bestBuyCandidate.symbol})`
+                      : 'Analyze BUY Candidate'}
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="ollama-analyze-sell-btn"
+                  onClick={() => void handleAnalyzeWithOllama('SELL', bestSellCandidate)}
+                  disabled={
+                    !bestSellCandidate ||
+                    ollamaStatus?.status !== 'READY' ||
+                    ollamaAnalyzingSide !== null ||
+                    ollamaChecking
+                  }
+                  title={
+                    !bestSellCandidate
+                      ? 'Run the market scanner first to detect a SELL candidate.'
+                      : ollamaStatus?.status !== 'READY'
+                        ? 'Local Ollama model must be READY before running analysis.'
+                        : `Analyze ${bestSellCandidate.symbol} with local Qwen`
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/15 px-3 py-1.5 text-[11px] font-semibold text-rose-200 transition hover:bg-rose-500/25 disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
+                >
+                  <TrendingDown className="w-3.5 h-3.5" />
+                  {ollamaAnalyzingSide === 'SELL'
+                    ? `Analyzing ${bestSellCandidate?.symbol ?? 'SELL'}...`
+                    : bestSellCandidate
+                      ? `Analyze SELL Candidate (${bestSellCandidate.symbol})`
+                      : 'Analyze SELL Candidate'}
+                </button>
+              </div>
+            </div>
+
+            {ollamaStatus?.message && (
+              <p
+                data-testid="ollama-status-message"
+                className={`text-xs ${
+                  ollamaDisplayState === 'READY'
+                    ? 'text-slate-300'
+                    : ollamaDisplayState === 'MODEL NOT INSTALLED'
+                      ? 'text-amber-300'
+                      : 'text-slate-400'
+                }`}
+              >
+                {ollamaStatus.message}
+              </p>
+            )}
+
+            {ollamaAnalyzingSide !== null && (
+              <div
+                data-testid="ollama-busy-banner"
+                className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-200"
+              >
+                Running local Qwen inference on CPU (<span className="font-mono">think: false</span>,{' '}
+                <span className="font-mono">num_ctx: 2048</span>). Only one request runs at a time; please wait.
+              </div>
+            )}
+
+            {ollamaError && (
+              <div
+                data-testid="ollama-error-banner"
+                className="flex items-start gap-2 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200"
+              >
+                <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span>{ollamaError}</span>
+              </div>
+            )}
+
+            {!bestBuyCandidate && !bestSellCandidate && (
+              <p
+                data-testid="ollama-no-candidates-note"
+                className="text-xs text-slate-400"
+              >
+                No directional BUY or SELL candidate is queued yet. Click <span className="font-semibold text-slate-200">START SCANNER</span> to compute real quantitative indicators before requesting local Qwen analysis.
+              </p>
+            )}
+
+            {ollamaAnalysis && (
+              <div
+                data-testid="ollama-analysis-result"
+                className="rounded-xl border border-slate-800 bg-[#070d17] p-4 space-y-3 text-xs"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-bold text-white">
+                      {ollamaAnalysis.analysis.symbol}
+                    </span>
+                    <span
+                      data-testid="ollama-decision"
+                      className={`rounded px-2 py-0.5 font-bold ${
+                        ollamaAnalysis.analysis.decision === 'BUY'
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : ollamaAnalysis.analysis.decision === 'SELL'
+                            ? 'bg-rose-500/20 text-rose-300'
+                            : 'bg-slate-800 text-slate-200'
+                      }`}
+                    >
+                      {ollamaAnalysis.analysis.decision}
+                    </span>
+                    <span className="font-mono text-[11px] text-slate-400">
+                      {ollamaAnalysis.model}
+                    </span>
+                  </div>
+                  <span className="text-[11px] text-slate-400 tabular-nums">
+                    Duration: <span className="font-semibold text-cyan-300">{ollamaAnalysis.durationMs} ms</span>
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 tabular-nums">
+                  <div>
+                    <p className="text-[11px] text-slate-500">Confidence (0–1)</p>
+                    <p data-testid="ollama-confidence" className="font-semibold text-cyan-300">
+                      {ollamaAnalysis.analysis.confidence.toFixed(2)}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[11px] text-slate-500">Market Regime</p>
+                    <p data-testid="ollama-regime" className="font-semibold text-slate-200">
+                      {ollamaAnalysis.analysis.marketRegime}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[11px] text-slate-500">Sentiment</p>
+                    <p data-testid="ollama-sentiment" className="font-semibold text-slate-200">
+                      {ollamaAnalysis.analysis.sentiment}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[11px] text-slate-500">Generated At</p>
+                    <p className="font-medium text-slate-300">
+                      {new Date(ollamaAnalysis.generatedAt).toLocaleTimeString()}
+                    </p>
+                  </div>
+                </div>
+
+                <p data-testid="ollama-rationale" className="text-slate-300 leading-relaxed">
+                  {ollamaAnalysis.analysis.rationale}
+                </p>
+
+                {ollamaAnalysis.analysis.riskFlags.length > 0 && (
+                  <div className="space-y-1">
+                    <p className="text-[11px] font-semibold text-amber-300">Risk Flags</p>
+                    <ul
+                      data-testid="ollama-risk-flags"
+                      className="list-disc pl-4 space-y-0.5 text-[11px] text-amber-200/90"
+                    >
+                      {ollamaAnalysis.analysis.riskFlags.map((flag, idx) => (
+                        <li key={`${flag}-${idx}`}>{flag}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <p className="text-[11px] text-slate-500">
+              Ollama runs from the TurboScalp Node.js backend (<span className="font-mono">OLLAMA_BASE_URL</span>). Confidence is an uncalibrated model self-assessment, not measured win probability.
+            </p>
           </div>
 
           {/* Open Positions, Actual Binance Entry & Algo Order IDs */}
