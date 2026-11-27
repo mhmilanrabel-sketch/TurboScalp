@@ -37,7 +37,7 @@ export interface AgentUnitStatus {
   detail: string;
 }
 
-export type TradingPolicyMode = 'GEMINI_REQUIRED' | 'QUANT_ONLY_PAPER';
+export type TradingPolicyMode = 'AI_REQUIRED' | 'QUANT_ONLY_PAPER';
 
 export interface AgentEngineConfig {
   environment: 'USD_M_FUTURES_DEMO';
@@ -66,7 +66,7 @@ export const DEFAULT_AGENT_CONFIG: AgentEngineConfig = Object.freeze({
   cooldownMinutes: 30,
   requireAiApproval: true,
   localAiApprovalEnabled: false,
-  tradingPolicy: 'GEMINI_REQUIRED',
+  tradingPolicy: 'AI_REQUIRED',
   quantOnlyPaperMode: false,
 });
 
@@ -385,7 +385,7 @@ export function sanitizeConfig(
       partial.tradingPolicy === 'QUANT_ONLY_PAPER' &&
       partial.quantOnlyPaperMode === true
         ? 'QUANT_ONLY_PAPER'
-        : 'GEMINI_REQUIRED',
+        : 'AI_REQUIRED',
     quantOnlyPaperMode:
       partial.tradingPolicy === 'QUANT_ONLY_PAPER' ||
       partial.quantOnlyPaperMode === true
