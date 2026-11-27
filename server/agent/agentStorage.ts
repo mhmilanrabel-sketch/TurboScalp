@@ -49,6 +49,8 @@ export interface AgentEngineConfig {
   maxDailyLossPct: number;
   cooldownMinutes: number;
   requireAiApproval: boolean;
+  /** Local Qwen may satisfy the AI gate only after explicit opt-in. Defaults to false. */
+  localAiApprovalEnabled: boolean;
   tradingPolicy: TradingPolicyMode;
   quantOnlyPaperMode: boolean;
 }
@@ -63,6 +65,7 @@ export const DEFAULT_AGENT_CONFIG: AgentEngineConfig = Object.freeze({
   maxDailyLossPct: 1.0,
   cooldownMinutes: 30,
   requireAiApproval: true,
+  localAiApprovalEnabled: false,
   tradingPolicy: 'GEMINI_REQUIRED',
   quantOnlyPaperMode: false,
 });
@@ -376,7 +379,8 @@ export function sanitizeConfig(
       5,
       240
     ),
-    requireAiApproval: true, // GEMINI_REQUIRED is always enforced for automated Demo entries
+    requireAiApproval: true, // AI approval remains required for automated Demo entries
+    localAiApprovalEnabled: partial.localAiApprovalEnabled === true,
     tradingPolicy:
       partial.tradingPolicy === 'QUANT_ONLY_PAPER' &&
       partial.quantOnlyPaperMode === true
