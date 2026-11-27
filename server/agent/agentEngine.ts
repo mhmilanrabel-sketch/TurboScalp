@@ -20,6 +20,7 @@ import {
   getSymbolCooldown,
   getTodayRealizedPnl,
   hasClientOrderId,
+  recordCriticalError,
   notifyTelegramEvent,
   setLastProcessedCandle,
   updateAgentConfig,
