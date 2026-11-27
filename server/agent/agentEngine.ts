@@ -572,7 +572,7 @@ async function runOrchestrationCycle(): Promise<void> {
       );
     }
 
-    // Agent 4: Mathematical Risk Manager evaluation (GEMINI_REQUIRED enforced for automated Demo entries)
+    // Agent 4: Mathematical Risk Manager evaluation (AI approval is required for automated Demo entries)
     const filterMap = new Map<string, ExchangeSymbolFilter>(
       discovered.markets.map((m) => [m.symbol, m.filter])
     );
@@ -636,7 +636,7 @@ async function runOrchestrationCycle(): Promise<void> {
       };
     };
 
-    // Always require AI approval (GEMINI_REQUIRED = true) for actual Demo execution risk gates
+    // Always require AI approval for actual Demo execution risk gates
     bestBuyOpportunity = runRiskFor(bestBuyQuant, true);
     bestSellOpportunity = runRiskFor(bestSellQuant, true);
 
