@@ -1073,10 +1073,9 @@ export function registerAgentEngineRoutes(
         latestExchangePositions = reconciled.snapshot.positions;
         latestOpenOrdersCount = reconciled.snapshot.openOrdersCount;
         return res.json({
-          success: true,
+          ...buildStatusResponse(),
           alreadyFlat: true,
           message: 'Binance confirms the position is already flat; trade journal reconciled.',
-          ...buildStatusResponse(),
         });
       }
 
@@ -1148,11 +1147,10 @@ export function registerAgentEngineRoutes(
         active.symbol
       );
       return res.json({
-        success: true,
+        ...buildStatusResponse(),
         alreadyFlat: false,
         orderId: closeResponse?.orderId ?? null,
         message: 'Binance confirms the position is flat. Trade history has been reconciled.',
-        ...buildStatusResponse(),
       });
     } catch (err: any) {
       recordCriticalError(
