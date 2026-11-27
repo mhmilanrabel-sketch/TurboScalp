@@ -66,6 +66,8 @@ export type GeminiSentiment = 'BULLISH' | 'BEARISH' | 'NEUTRAL';
 
 export interface GeminiAnalysisResult {
   symbol: string;
+  /** Identifies the analysis source; omitted for legacy Gemini results. */
+  provider?: 'GEMINI' | 'QWEN_LOCAL';
   available: boolean;
   degraded: boolean;
   quotaExhausted?: boolean;
