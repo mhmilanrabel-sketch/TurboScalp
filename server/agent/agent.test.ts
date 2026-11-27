@@ -50,6 +50,8 @@ import {
   getCriticalErrors,
   getPerformanceSummary,
   getSymbolCooldown,
+  DEFAULT_AGENT_CONFIG,
+  sanitizeConfig,
   notifyTelegramEvent,
   syncDailyEquity,
 } from './agentStorage.js';
@@ -283,6 +285,27 @@ test('TEST 3: Risk Manager mathematical formula, exchange step/tick rounding & e
     const out = evaluateRisk(scenario);
     assert.equal(out.approved, false, `Expected rejection for: ${label}`);
   }
+});
+
+test('Local Qwen remains advisory unless explicitly enabled in config and Risk Manager input', () => {
+  assert.equal(DEFAULT_AGENT_CONFIG.localAiApprovalEnabled, false);
+  assert.equal(sanitizeConfig({ localAiApprovalEnabled: true }).localAiApprovalEnabled, true);
+  assert.equal(sanitizeConfig({ localAiApprovalEnabled: 1 as any }).localAiApprovalEnabled, false);
+
+  const advisoryInput = makeRiskInput();
+  advisoryInput.aiAnalysis!.provider = 'QWEN_LOCAL';
+  const advisoryDecision = evaluateRisk(advisoryInput);
+  assert.equal(advisoryDecision.approved, false);
+  assert.match(
+    advisoryDecision.checks.find((check) => check.name === 'AI Analyst Approval')?.detail || '',
+    /advisory mode/i
+  );
+
+  const explicitlyEnabledInput = makeRiskInput();
+  explicitlyEnabledInput.aiAnalysis!.provider = 'QWEN_LOCAL';
+  explicitlyEnabledInput.allowLocalAiApproval = true;
+  const enabledDecision = evaluateRisk(explicitlyEnabledInput);
+  assert.equal(enabledDecision.approved, true);
 });
 
 test('TEST 4: Paper-trading closed-candle simulation enforces limits without exchange writes', () => {
