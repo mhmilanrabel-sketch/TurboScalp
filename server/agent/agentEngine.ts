@@ -1023,6 +1023,150 @@ export function registerAgentEngineRoutes(
     }
   });
 
+  app.post('/api/agent/position/close', async (req: Request, res: Response) => {
+    if (deps?.validateMutationOrigin && !deps.validateMutationOrigin(req)) {
+      return res.status(403).json({ success: false, error: 'Cross-origin mutation rejected.' });
+    }
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({ success: false, error: 'Explicit close confirmation is required.' });
+    }
+
+    await ensureAgentStorageLoaded();
+    const active = getActiveTradeRecord();
+    if (!active) {
+      return res.status(404).json({ success: false, error: 'No tracked open Demo trade exists.' });
+    }
+
+    const credentials = deps!.getCredentials(req, false) || activeCredentials;
+    if (!credentials?.apiKey || !credentials?.apiSecret) {
+      return res.status(401).json({ success: false, error: 'Connect Binance Futures Demo before closing the position.' });
+    }
+    activeCredentials = credentials;
+
+    try {
+      const before = await deps!.binanceRequest<any[]>(
+        'GET',
+        '/fapi/v3/positionRisk',
+        { symbol: active.symbol },
+        true,
+        credentials
+      );
+      if (!Array.isArray(before)) {
+        throw new Error('Binance returned an invalid position snapshot; close was not submitted.');
+      }
+
+      const live = before.find((p) =>
+        p.symbol === active.symbol &&
+        (active.positionMode === 'ONE_WAY' || p.positionSide === active.positionSide) &&
+        Math.abs(Number(p.positionAmt || 0)) > 1e-12
+      );
+
+      // A user may already have closed the position manually on Binance.
+      // Reconcile the journal only after the exchange snapshot confirms flat.
+      if (!live) {
+        const reconciled = await reconcilePositionAndOrders(
+          deps!.binanceRequest,
+          credentials,
+          getAgentConfig().cooldownMinutes
+        );
+        latestExchangePositions = reconciled.snapshot.positions;
+        latestOpenOrdersCount = reconciled.snapshot.openOrdersCount;
+        return res.json({
+          success: true,
+          alreadyFlat: true,
+          message: 'Binance confirms the position is already flat; trade journal reconciled.',
+          ...buildStatusResponse(),
+        });
+      }
+
+      const quantity = Math.abs(Number(live.positionAmt)).toString();
+      const closeParams: Record<string, any> = {
+        symbol: active.symbol,
+        side: active.side === 'BUY' ? 'SELL' : 'BUY',
+        type: 'MARKET',
+        quantity,
+        newClientOrderId: `TS-MANUAL-CLOSE-${Date.now()}`,
+        newOrderRespType: 'RESULT',
+      };
+      if (active.positionMode === 'HEDGE') {
+        closeParams.positionSide = active.positionSide;
+      } else {
+        closeParams.reduceOnly = 'true';
+      }
+
+      let closeResponse: any = null;
+      let submitError: unknown = null;
+      try {
+        closeResponse = await deps!.binanceRequest<any>(
+          'POST',
+          '/fapi/v1/order',
+          closeParams,
+          true,
+          credentials
+        );
+      } catch (err) {
+        submitError = err;
+      }
+
+      // Never infer closure from the POST response. Re-read Binance position risk.
+      const after = await deps!.binanceRequest<any[]>(
+        'GET',
+        '/fapi/v3/positionRisk',
+        { symbol: active.symbol },
+        true,
+        credentials
+      );
+      if (!Array.isArray(after)) {
+        throw new Error('Close request outcome is uncertain: Binance position verification returned an invalid response. Check the Demo account before retrying.');
+      }
+      const remaining = after.find((p) =>
+        p.symbol === active.symbol &&
+        (active.positionMode === 'ONE_WAY' || p.positionSide === active.positionSide)
+      );
+      const remainingQty = Math.abs(Number(remaining?.positionAmt || 0));
+      if (remainingQty > 1e-12) {
+        const reason = submitError instanceof Error ? submitError.message : 'Binance still reports an open position.';
+        return res.status(409).json({
+          success: false,
+          error: `Position is not confirmed closed (remaining quantity ${remainingQty}). ${reason} Do not submit another close until the exchange state is checked.`,
+          orderId: closeResponse?.orderId ?? null,
+        });
+      }
+
+      const reconciled = await reconcilePositionAndOrders(
+        deps!.binanceRequest,
+        credentials,
+        getAgentConfig().cooldownMinutes
+      );
+      latestExchangePositions = reconciled.snapshot.positions;
+      latestOpenOrdersCount = reconciled.snapshot.openOrdersCount;
+      appendAgentLog(
+        'AGENT_5_EXECUTION',
+        'TRADE',
+        `Manual close verified by Binance for ${active.symbol}; order=${closeResponse?.orderId ?? 'response unavailable'}.`,
+        active.symbol
+      );
+      return res.json({
+        success: true,
+        alreadyFlat: false,
+        orderId: closeResponse?.orderId ?? null,
+        message: 'Binance confirms the position is flat. Trade history has been reconciled.',
+        ...buildStatusResponse(),
+      });
+    } catch (err: any) {
+      recordCriticalError(
+        'MANUAL_CLOSE_UNVERIFIED',
+        err?.message || 'Manual close could not be verified. Check Binance Demo directly.',
+        active.symbol
+      );
+      return res.status(502).json({
+        success: false,
+        error: err?.message || 'Manual close could not be verified. Check Binance Demo directly.',
+        exchangeState: 'UNKNOWN',
+      });
+    }
+  });
+
   app.post('/api/agent/pause', async (req: Request, res: Response) => {
     if (deps?.validateMutationOrigin && !deps.validateMutationOrigin(req)) {
       return res.status(403).json({ success: false, error: 'Cross-origin mutation rejected.' });
