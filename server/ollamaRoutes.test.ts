@@ -90,6 +90,39 @@ test('validateOllamaInput enforces USDT symbol, positive price, finite score, an
   );
 });
 
+test('validateOllamaInput sanitizes optional closed-trade learning context', () => {
+  const valid = validateOllamaInput({
+    symbol: 'BTCUSDT',
+    quant: { direction: 'BUY', score: 78, price: 95000 },
+    learning: {
+      overall: { sampleCount: 10, wins: 6, losses: 3, flats: 1, winRatePct: 66.7, avgNetPnl: 2.35 },
+      symbol: { sampleCount: 4, wins: 2, losses: 1, flats: 1, winRatePct: 66.7, avgNetPnl: 0.42 },
+      recentOutcomes: [
+        { side: 'BUY', outcome: 'WIN' },
+        { side: 'SELL', outcome: 'LOSS' },
+        { side: 'IGNORE', outcome: 'WIN' },
+      ],
+    },
+  });
+  assert.equal(valid.learning?.overall.sampleCount, 10);
+  assert.equal(valid.learning?.symbol.winRatePct, 66.7);
+  assert.deepEqual(valid.learning?.recentOutcomes, [
+    { side: 'BUY', outcome: 'WIN' },
+    { side: 'SELL', outcome: 'LOSS' },
+  ]);
+
+  const invalid = validateOllamaInput({
+    symbol: 'BTCUSDT',
+    quant: { direction: 'BUY', score: 78, price: 95000 },
+    learning: {
+      overall: { sampleCount: 2, wins: 3, losses: 0, flats: 0, winRatePct: 150, avgNetPnl: 0 },
+      symbol: { sampleCount: 1, wins: 1, losses: 0, flats: 0, winRatePct: 100, avgNetPnl: 0 },
+      recentOutcomes: [{ side: 'BUY', outcome: 'WIN' }],
+    },
+  });
+  assert.equal(invalid.learning, undefined);
+});
+
 test('getOllamaStatus reports READY, MODEL_NOT_INSTALLED, and OFFLINE accurately', async () => {
   const ready = await getOllamaStatus({
     get: async () => ({ data: { models: [{ name: 'qwen3.5:4b' }] } }) as any,
