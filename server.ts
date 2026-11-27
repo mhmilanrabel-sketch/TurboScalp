@@ -864,29 +864,19 @@ app.get('/api/binance/open-orders', async (req, res) => {
       credentials
     );
 
-    let algoOrders: any[] = [];
-    try {
-      const r = await binanceRequest<any[]>(
-        'GET',
-        '/fapi/v1/openAlgoOrders',
-        params,
-        true,
-        credentials
+    const algoOrders = await binanceRequest<any[]>(
+      'GET',
+      '/fapi/v1/openAlgoOrders',
+      params,
+      true,
+      credentials
+    );
+
+    if (!Array.isArray(algoOrders)) {
+      throw new BinanceRequestError(
+        'Binance returned an invalid open conditional orders response.',
+        502
       );
-      algoOrders = Array.isArray(r) ? r : [];
-    } catch {
-      try {
-        const r = await binanceRequest<any[]>(
-          'GET',
-          '/fapi/v1/algoOpenOrders',
-          params,
-          true,
-          credentials
-        );
-        algoOrders = Array.isArray(r) ? r : [];
-      } catch {
-        algoOrders = [];
-      }
     }
 
     const normalizedAlgoOrders = algoOrders.map((order) => ({
