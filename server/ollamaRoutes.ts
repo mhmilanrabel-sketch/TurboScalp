@@ -7,9 +7,25 @@ export type OllamaConfig = {
   timeoutMs: number;
 };
 
+export type LearningSummary = {
+  sampleCount: number;
+  wins: number;
+  losses: number;
+  flats: number;
+  winRatePct: number | null;
+  avgNetPnl: number;
+};
+
+export type LocalLearningContext = {
+  overall: LearningSummary;
+  symbol: LearningSummary;
+  recentOutcomes: Array<{ side: "BUY" | "SELL"; outcome: "WIN" | "LOSS" | "FLAT" }>;
+};
+
 export type QuantInput = {
   symbol: string;
   quant: Record<string, number | string>;
+  learning?: LocalLearningContext;
 };
 
 export type OllamaAnalysis = {
@@ -134,7 +150,10 @@ const ANALYSIS_SCHEMA = {
 const SYSTEM_PROMPT = `
 You are the local quantitative market analyst for TurboScalp.
 
-Analyse only the supplied numerical market features.
+Analyse the supplied numerical market features and optional closed-trade learning summary.
+Learning is historical context only, not proof of future performance. Prefer HOLD when the sample is small,
+when results are mixed, or when current indicators conflict. Never treat historical win rate as a
+probability of this trade winning. Do not infer missing learning data.
 
 You do not have permission to place orders, call exchange APIs,
 change leverage, calculate account permissions, or manage funds.
@@ -257,7 +276,47 @@ export function validateOllamaInput(body: any): QuantInput {
     quant.direction = normalized;
   }
 
-  return { symbol, quant };
+  const learning = sanitizeLearningContext(body?.learning);
+  return { symbol, quant, ...(learning ? { learning } : {}) };
+}
+
+function sanitizeLearningSummary(value: any): LearningSummary | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const integer = (v: any) => Number.isInteger(v) && v >= 0 && v <= 2000;
+  const finite = (v: any) => typeof v === "number" && Number.isFinite(v);
+  if (
+    !integer(value.sampleCount) ||
+    !integer(value.wins) ||
+    !integer(value.losses) ||
+    !integer(value.flats) ||
+    value.wins + value.losses + value.flats !== value.sampleCount ||
+    !(value.winRatePct === null || (finite(value.winRatePct) && value.winRatePct >= 0 && value.winRatePct <= 100)) ||
+    !finite(value.avgNetPnl) ||
+    Math.abs(value.avgNetPnl) > 1_000_000
+  ) return null;
+  return {
+    sampleCount: value.sampleCount,
+    wins: value.wins,
+    losses: value.losses,
+    flats: value.flats,
+    winRatePct: value.winRatePct,
+    avgNetPnl: Number(value.avgNetPnl.toFixed(4)),
+  };
+}
+
+function sanitizeLearningContext(value: any): LocalLearningContext | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const overall = sanitizeLearningSummary(value.overall);
+  const symbol = sanitizeLearningSummary(value.symbol);
+  if (!overall || !symbol || symbol.sampleCount > overall.sampleCount) return undefined;
+  const recentOutcomes = Array.isArray(value.recentOutcomes)
+    ? value.recentOutcomes.slice(-8).flatMap((item: any) => {
+        if (!item || !["BUY", "SELL"].includes(item.side) ||
+            !["WIN", "LOSS", "FLAT"].includes(item.outcome)) return [];
+        return [{ side: item.side, outcome: item.outcome }];
+      })
+    : [];
+  return { overall, symbol, recentOutcomes };
 }
 
 export async function getOllamaStatus(httpClient: OllamaHttpClient = axios) {
@@ -340,7 +399,12 @@ export async function analyzeWithOllama(
               role: "user",
               content: JSON.stringify({
                 symbol: input.symbol,
-                quantitativeFeatures: input.quant
+                quantitativeFeatures: input.quant,
+                historicalLearning: input.learning ?? {
+                  overall: { sampleCount: 0, wins: 0, losses: 0, flats: 0, winRatePct: null, avgNetPnl: 0 },
+                  symbol: { sampleCount: 0, wins: 0, losses: 0, flats: 0, winRatePct: null, avgNetPnl: 0 },
+                  recentOutcomes: []
+                }
               })
             }
           ],

@@ -110,6 +110,35 @@ let latestOpenOrdersCount = 0;
 let sessionPermissionDiagnostics: FuturesPermissionDiagnostics | null = null;
 let lastLoggedQuotaErrorKey = '';
 
+function summarizeLocalLearning(samples: ReturnType<typeof getLearningSamples>, symbol: string) {
+  const summarize = (items: typeof samples) => {
+    const wins = items.filter((sample) => sample.outcome === 'WIN').length;
+    const losses = items.filter((sample) => sample.outcome === 'LOSS').length;
+    const flats = items.filter((sample) => sample.outcome === 'FLAT').length;
+    const decisive = wins + losses;
+    const avgNetPnl = items.length
+      ? items.reduce((sum, sample) => sum + sample.netPnl, 0) / items.length
+      : 0;
+    return {
+      sampleCount: items.length,
+      wins,
+      losses,
+      flats,
+      winRatePct: decisive ? Number(((wins / decisive) * 100).toFixed(1)) : null,
+      avgNetPnl: Number(avgNetPnl.toFixed(4)),
+    };
+  };
+  const recent = samples.slice(-60);
+  return {
+    overall: summarize(recent),
+    symbol: summarize(recent.filter((sample) => sample.symbol === symbol)),
+    recentOutcomes: recent.slice(-8).map((sample) => ({
+      side: sample.side,
+      outcome: sample.outcome,
+    })),
+  };
+}
+
 function mapLocalQwenResult(
   response: Awaited<ReturnType<typeof analyzeWithOllama>>
 ): GeminiAnalysisResult {
@@ -181,6 +210,7 @@ function scheduleLocalQwenAnalysis(candidate: QuantAnalysisResult): void {
       change24h: candidate.change24h,
       volume24h: candidate.quoteVolume,
     },
+    learning: summarizeLocalLearning(getLearningSamples(60), candidate.symbol),
   })
     .then((response) => {
       const result = mapLocalQwenResult(response);
