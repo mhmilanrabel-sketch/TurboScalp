@@ -210,7 +210,7 @@ export type GeminiErrorCategory =
   | 'NETWORK_ERROR'
   | 'CONFIG_ERROR'
   | 'SCHEMA_ERROR';
-export type TradingPolicyMode = 'GEMINI_REQUIRED' | 'QUANT_ONLY_PAPER';
+export type TradingPolicyMode = 'AI_REQUIRED' | 'QUANT_ONLY_PAPER';
 
 export interface AgentUnitStatus {
   id: AgentName;
