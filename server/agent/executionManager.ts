@@ -118,25 +118,19 @@ export async function fetchOpenAlgoOrdersSafe(
   symbol?: string
 ): Promise<any[]> {
   const query = symbol ? { symbol } : {};
-  try {
-    const resp = await binanceRequest<any[]>(
-      'GET',
-      '/fapi/v1/openAlgoOrders',
-      query,
-      true,
-      credentials
-    );
-    return Array.isArray(resp) ? resp : [];
-  } catch {
-    const resp = await binanceRequest<any[]>(
-      'GET',
-      '/fapi/v1/algoOpenOrders',
-      query,
-      true,
-      credentials
-    );
-    return Array.isArray(resp) ? resp : [];
+  const resp = await binanceRequest<any[]>(
+    'GET',
+    '/fapi/v1/openAlgoOrders',
+    query,
+    true,
+    credentials
+  );
+
+  if (!Array.isArray(resp)) {
+    throw new Error('Binance returned an invalid open algo orders response.');
   }
+
+  return resp;
 }
 
 export async function cancelAlgoOrderSafe(
