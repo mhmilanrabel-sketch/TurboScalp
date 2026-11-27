@@ -116,6 +116,8 @@ export interface RiskEvaluationInput {
   inFlightSymbols: Set<string>;
   duplicateClientOrderExists?: boolean;
   requireAiApproval: boolean;
+  /** Qwen remains advisory unless the independent setting is explicitly true. */
+  allowLocalAiApproval?: boolean;
   minSignalScore?: number;
   maxNotionalUsd?: number;
   maxLeverage?: number;
@@ -308,18 +310,24 @@ export function evaluateRisk(input: RiskEvaluationInput): RiskDecision {
     const hasCriticalFlag = Boolean(
       ai?.riskFlags?.some((f) => f.toUpperCase().includes('CRITICAL'))
     );
+    const localApprovalAllowed =
+      ai?.provider !== 'QWEN_LOCAL' || input.allowLocalAiApproval === true;
     const aiOk = Boolean(
       ai &&
         ai.available &&
         !ai.degraded &&
+        localApprovalAllowed &&
         ai.direction === input.signal.direction &&
         ai.confidence >= HARD_RISK_CONSTANTS.MIN_AI_CONFIDENCE &&
         !hasCriticalFlag
     );
 
-    let aiDetail = ai?.usedFallback
-      ? `Gemini Fallback (${ai.modelUsed || 'fallback'}) aligned with technical direction.`
-      : 'Gemini AI Analyst aligned with technical direction.';
+    let aiDetail =
+      ai?.provider === 'QWEN_LOCAL'
+        ? 'Local Qwen analysis aligned with technical direction.'
+        : ai?.usedFallback
+          ? `Gemini Fallback (${ai.modelUsed || 'fallback'}) aligned with technical direction.`
+          : 'Gemini AI Analyst aligned with technical direction.';
     if (!ai || !ai.available || ai.degraded || ai.quotaExhausted) {
       if (ai?.quotaExhausted || ai?.errorCategory === 'QUOTA_429') {
         aiDetail =
@@ -332,6 +340,8 @@ export function evaluateRisk(input: RiskEvaluationInput): RiskDecision {
         aiDetail =
           'AI Analyst is unavailable or DEGRADED while AI approval is required.';
       }
+    } else if (ai.provider === 'QWEN_LOCAL' && !localApprovalAllowed) {
+      aiDetail = 'Local Qwen is running in advisory mode. Explicit Qwen trade approval is disabled.';
     } else if (ai.direction !== input.signal.direction) {
       aiDetail = `Technical (${input.signal.direction}) and AI (${ai.direction} · ${ai.marketRegime}) directions conflict.`;
     } else if (ai.confidence < HARD_RISK_CONSTANTS.MIN_AI_CONFIDENCE) {
@@ -339,7 +349,7 @@ export function evaluateRisk(input: RiskEvaluationInput): RiskDecision {
     } else if (hasCriticalFlag) {
       aiDetail = `AI Analyst flagged critical market risk: ${ai.riskFlags.join(', ')}.`;
     }
-    record('Gemini AI Alignment', aiOk, aiDetail);
+    record('AI Analyst Approval', aiOk, aiDetail);
   }
 
   // 9. Exchange symbol rules & stop-loss validity
