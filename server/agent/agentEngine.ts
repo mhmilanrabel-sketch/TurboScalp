@@ -34,7 +34,6 @@ import {
   type DemoCredentials,
 } from './executionManager.js';
 import {
-  analyzeQualifiedCandidatesBatch,
   ensureGeminiManagerLoaded,
   getGeminiQuotaStatus,
   recheckGeminiAvailability,
@@ -65,6 +64,7 @@ import {
   runNonExecutingPermissionDiagnostic,
   type FuturesPermissionDiagnostics,
 } from '../permissionDiagnostics.js';
+import { analyzeWithOllama } from '../ollamaRoutes.js';
 
 export type EngineRunMode = 'STOPPED' | 'SCAN_ONLY' | 'AUTO_TRADING' | 'PAUSED';
 
@@ -100,11 +100,132 @@ let latestCandidates: QuantAnalysisResult[] = [];
 let bestBuyOpportunity: OpportunitySnapshot | null = null;
 let bestSellOpportunity: OpportunitySnapshot | null = null;
 let lastAiAnalysis: { symbol: string; result: GeminiAnalysisResult } | null = null;
+type LocalAiCacheEntry = { candleTime: number; result: GeminiAnalysisResult };
+const localAiResults = new Map<string, LocalAiCacheEntry>();
+let localAiInFlightSymbol: string | null = null;
+let localAiRetryAfter = 0;
 let lastRiskDecision: RiskDecision | null = null;
 let latestExchangePositions: ExchangePositionSnapshot[] = [];
 let latestOpenOrdersCount = 0;
 let sessionPermissionDiagnostics: FuturesPermissionDiagnostics | null = null;
 let lastLoggedQuotaErrorKey = '';
+
+function mapLocalQwenResult(
+  response: Awaited<ReturnType<typeof analyzeWithOllama>>
+): GeminiAnalysisResult {
+  const analysis = response.analysis;
+  const marketRegime: GeminiAnalysisResult['marketRegime'] =
+    analysis.marketRegime === 'TRENDING_UP' || analysis.marketRegime === 'TRENDING_DOWN'
+      ? 'TRENDING'
+      : analysis.marketRegime === 'RANGE'
+        ? 'SIDEWAYS'
+        : analysis.marketRegime === 'HIGH_VOLATILITY'
+          ? 'VOLATILE'
+          : 'CONFLICTED';
+
+  return {
+    symbol: analysis.symbol,
+    provider: 'QWEN_LOCAL',
+    available: true,
+    degraded: false,
+    quotaExhausted: false,
+    modelUsed: `${response.model} (LOCAL)`,
+    usedFallback: false,
+    direction: analysis.decision,
+    marketRegime,
+    confidence: analysis.confidence,
+    sentiment: analysis.sentiment === 'NOT_PROVIDED' ? 'NEUTRAL' : analysis.sentiment,
+    riskFlags: analysis.riskFlags,
+    reasoning: analysis.rationale,
+    analyzedAt: Date.parse(response.generatedAt) || Date.now(),
+  };
+}
+
+function scheduleLocalQwenAnalysis(candidate: QuantAnalysisResult): void {
+  if (candidate.direction === 'HOLD' || localAiInFlightSymbol) return;
+  if (Date.now() < localAiRetryAfter) return;
+  const existing = localAiResults.get(candidate.symbol);
+  if (existing?.candleTime === candidate.latestClosedCandleTime) return;
+
+  localAiInFlightSymbol = candidate.symbol;
+  lastAiAnalysis = null;
+  setAgentStatus(
+    'aiAnalyst',
+    'ACTIVE',
+    `Local Qwen is analyzing ${candidate.symbol} (${candidate.signalStrengthScore}/100); execution remains subject to Risk Manager policy.`
+  );
+  appendAgentLog(
+    'AGENT_3_GEMINI',
+    'INFO',
+    `LOCAL QWEN analysis started for ${candidate.symbol} candle=${candidate.latestClosedCandleTime}.`,
+    candidate.symbol
+  );
+
+  // Do not await CPU inference here: the exchange position/order monitor must
+  // continue running while Qwen generates its response.
+  void analyzeWithOllama({
+    symbol: candidate.symbol,
+    quant: {
+      direction: candidate.direction,
+      score: candidate.signalStrengthScore,
+      price: candidate.price,
+      rsi: candidate.rsi14,
+      ema9: candidate.ema9_5m,
+      ema21: candidate.ema21_5m,
+      ema50: candidate.ema50_5m,
+      macd: candidate.macd,
+      macdSignal: candidate.macdSignal,
+      atr: candidate.atr14,
+      volumeRatio: candidate.volumeRatio,
+      volatilityPct: candidate.volatilityPct,
+      change24h: candidate.change24h,
+      volume24h: candidate.quoteVolume,
+    },
+  })
+    .then((response) => {
+      const result = mapLocalQwenResult(response);
+      localAiResults.set(candidate.symbol, {
+        candleTime: candidate.latestClosedCandleTime,
+        result,
+      });
+      while (localAiResults.size > 24) {
+        const oldestKey = localAiResults.keys().next().value;
+        if (!oldestKey) break;
+        localAiResults.delete(oldestKey);
+      }
+      lastAiAnalysis = { symbol: candidate.symbol, result };
+      localAiRetryAfter = 0;
+      setAgentStatus(
+        'aiAnalyst',
+        'ACTIVE',
+        `LOCAL QWEN READY: ${candidate.symbol} · ${result.direction} · ${(result.confidence * 100).toFixed(0)}% self-assessed confidence · ${response.durationMs}ms`
+      );
+      appendAgentLog(
+        'AGENT_3_GEMINI',
+        'INFO',
+        `LOCAL QWEN result: ${result.direction} ${candidate.symbol} regime=${result.marketRegime} confidence=${result.confidence.toFixed(2)}. Advisory unless local Qwen approval is explicitly enabled.`,
+        candidate.symbol
+      );
+    })
+    .catch((error: any) => {
+      localAiRetryAfter = Date.now() + 30_000;
+      if (lastAiAnalysis?.symbol === candidate.symbol) lastAiAnalysis = null;
+      setAgentStatus(
+        'aiAnalyst',
+        'DEGRADED',
+        `Local Qwen unavailable: ${error?.message || 'analysis failed'}. Exchange monitoring remains independent.`
+      );
+      appendAgentLog(
+        'AGENT_3_GEMINI',
+        'WARN',
+        `LOCAL QWEN analysis failed: ${error?.message || 'unknown error'}. Retry after cooldown.`,
+        candidate.symbol
+      );
+    })
+    .finally(() => {
+      localAiInFlightSymbol = null;
+    });
+}
 
 export function updateSessionPermissionDiagnostics(
   diag: FuturesPermissionDiagnostics | null
@@ -148,8 +269,8 @@ const agentStatuses: Record<AgentName, AgentUnitStatus> = {
   },
   aiAnalyst: {
     id: 'aiAnalyst',
-    label: '3. Gemini AI Analyst',
-    role: 'Regime & sentiment validation via structured JSON (DEGRADED if down)',
+    label: '3. Local Qwen AI Analyst',
+    role: 'Local-first structured market analysis; Gemini is optional',
     status: 'IDLE',
     lastRunAt: null,
     detail: 'Waiting for top candidate setup',
@@ -426,42 +547,29 @@ async function runOrchestrationCycle(): Promise<void> {
       return;
     }
 
-    // Agent 3: Smart Batched Gemini AI Market Analyst (up to 3 qualified candidates per call)
-    // Never wastes requests on non-actionable HOLD markets.
-    let aiResultsMap = new Map<string, GeminiAnalysisResult>();
-    if (qualifiedCandidates.length > 0) {
-      const preStatus = getGeminiQuotaStatus();
-      setAgentStatus(
-        'aiAnalyst',
-        preStatus.status === 'RECOVERING' ? 'RECOVERING' : preStatus.status,
-        `Checking up to 3 qualified setups (${qualifiedCandidates.length} awaiting)`
-      );
-      const batchOutcome = await analyzeQualifiedCandidatesBatch(
-        qualifiedCandidates.slice(0, 3)
-      );
-      aiResultsMap = batchOutcome.resultsBySymbol;
-
-      const primaryAi = aiResultsMap.get(qualifiedCandidates[0].symbol);
-      if (primaryAi) {
-        lastAiAnalysis = { symbol: qualifiedCandidates[0].symbol, result: primaryAi };
+    // Agent 3: Local-first Qwen. Analyze one top candidate at a time to bound
+    // CPU/RAM use. Analysis runs in the background, never blocking monitoring.
+    const aiResultsMap = new Map<string, GeminiAnalysisResult>();
+    if (qualifiedCandidates.length > 0 && topCandidate.direction !== 'HOLD') {
+      const cachedLocal = localAiResults.get(topCandidate.symbol);
+      if (cachedLocal?.candleTime === topCandidate.latestClosedCandleTime) {
+        aiResultsMap.set(topCandidate.symbol, cachedLocal.result);
+        lastAiAnalysis = { symbol: topCandidate.symbol, result: cachedLocal.result };
+        setAgentStatus(
+          'aiAnalyst',
+          'ACTIVE',
+          `LOCAL QWEN READY: ${topCandidate.symbol} · ${cachedLocal.result.direction} · ${(cachedLocal.result.confidence * 100).toFixed(0)}% self-assessed confidence`
+        );
+      } else {
+        scheduleLocalQwenAnalysis(topCandidate);
       }
-
-      syncAiAnalystAgentCard(
-        batchOutcome.quotaStatus,
-        primaryAi,
-        batchOutcome.cacheHits,
-        qualifiedCandidates[0].symbol
-      );
     } else {
       setGeminiAwaitingCandidatesCount(0);
-      const qStatus = getGeminiQuotaStatus();
-      syncAiAnalystAgentCard(qStatus);
-      if (qStatus.status === 'STANDBY' || qStatus.status === 'ACTIVE') {
-        agentStatuses.aiAnalyst = {
-          ...agentStatuses.aiAnalyst,
-          detail: `0 qualified signals (>= ${cfg.minSignalScore}) — skipping Gemini call to conserve quota (${qStatus.requestsUsedToday}/${qStatus.maxDailyRequests})`,
-        };
-      }
+      setAgentStatus(
+        'aiAnalyst',
+        'STANDBY',
+        `Waiting for a qualified directional setup (minimum ${cfg.minSignalScore}/100). Local Qwen is primary; Gemini remains optional.`
+      );
     }
 
     // Agent 4: Mathematical Risk Manager evaluation (GEMINI_REQUIRED enforced for automated Demo entries)
@@ -513,6 +621,7 @@ async function runOrchestrationCycle(): Promise<void> {
         inFlightSymbols,
         duplicateClientOrderExists: hasClientOrderId(clientOrderId),
         requireAiApproval: requireAiForDecision,
+        allowLocalAiApproval: cfg.localAiApprovalEnabled,
         minSignalScore: cfg.minSignalScore,
         maxNotionalUsd: cfg.maxOrderNotionalUsd,
         maxLeverage: cfg.maxLeverage,
@@ -584,12 +693,8 @@ async function runOrchestrationCycle(): Promise<void> {
       );
     }
 
-    const topOpportunity =
-      topCandidate.direction === 'BUY'
-        ? bestBuyOpportunity
-        : topCandidate.direction === 'SELL'
-          ? bestSellOpportunity
-          : runRiskFor(topCandidate, true);
+    // Evaluate the exact top candidate that received this candle's Qwen result.
+    const topOpportunity = runRiskFor(topCandidate, true);
 
     const decision = topOpportunity?.riskDecision ?? null;
     lastRiskDecision = decision;
@@ -657,7 +762,13 @@ async function runOrchestrationCycle(): Promise<void> {
     ) {
       const symFilter = filterMap.get(topCandidate.symbol);
       const topAiResult = aiResultsMap.get(topCandidate.symbol) ?? null;
-      if (symFilter && topAiResult?.available && !topAiResult.degraded && !topAiResult.quotaExhausted) {
+      if (
+        symFilter &&
+        topAiResult?.available &&
+        !topAiResult.degraded &&
+        !topAiResult.quotaExhausted &&
+        (topAiResult.provider !== 'QWEN_LOCAL' || cfg.localAiApprovalEnabled)
+      ) {
         const execRes = await executeApprovedOrder(
           decision,
           topCandidate,
